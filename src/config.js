@@ -2,7 +2,7 @@
  * Central configuration.
  *
  * To point the app at a real backend, set VITE_API_URL in your environment
- * (.env file locally, or the build-time variables in GitHub Actions / Azure).
+ * (.env file locally, or set before running `npm run build` when deploying).
  * This is the ONLY place that needs to change when the backend becomes available.
  */
 
