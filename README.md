@@ -3,7 +3,7 @@
 Web frontend for detecting AI-generated images. The user uploads an image and
 receives a verdict (**Real** / **AI-generated**) with a confidence score.
 
-Built with **React + Vite**, deployed to **Azure Static Web Apps** via GitHub Actions.
+Built with **React + Vite**, deployed to **Firebase Hosting**.
 
 ## Features
 
@@ -53,42 +53,60 @@ npm run build    # outputs to /dist
 npm run preview  # preview the production build
 ```
 
-## Deployment (Azure Static Web Apps)
+## Deployment (Firebase Hosting)
 
-Pushing to `main` triggers `.github/workflows/deploy-frontend.yml`, which builds
-the app and deploys `/dist`.
+One-time setup:
 
-### Required GitHub secret
+```bash
+npm install -g firebase-tools   # install the Firebase CLI
+firebase login                  # log in with your Google account
+```
 
-| Secret | Where to get it |
-| --- | --- |
-| `AZURE_STATIC_WEB_APPS_API_TOKEN` | Azure Portal → your Static Web App → **Manage deployment token** |
+Create a project at https://console.firebase.google.com, then point this repo
+at it (replaces the placeholder in `.firebaserc`):
 
-Add it under **GitHub repo → Settings → Secrets and variables → Actions → New repository secret**.
+```bash
+firebase use --add              # pick your project, alias it "default"
+```
 
-> `GITHUB_TOKEN` is provided automatically by GitHub Actions — you do not add it.
+Deploy (build first, then upload `/dist`):
+
+```bash
+npm run build
+firebase deploy
+```
+
+The app goes live at `https://<your-project-id>.web.app`.
+
+Config lives in `firebase.json`: it serves the `dist/` folder and rewrites all
+routes to `index.html` (SPA routing).
 
 ### Pointing the deployed app at the real backend
 
-In `.github/workflows/deploy-frontend.yml`, under the build step's `env:`, set
-`VITE_API_URL` and change `VITE_USE_MOCK` to `"false"`. These are baked in at
-build time.
+Set the env vars before building, then deploy:
+
+```bash
+VITE_API_URL=https://your-backend.example.com VITE_USE_MOCK=false npm run build
+firebase deploy
+```
+
+(or put them in a local `.env` file — see `.env.example`).
 
 ## Project structure
 
 ```
 .
-├── .github/workflows/deploy-frontend.yml   # CI/CD: build + deploy to Azure
 ├── src/
 │   ├── components/
-│   │   ├── UploadForm.jsx                   # Drag & drop + validation
-│   │   └── ResultCard.jsx                   # Label + confidence bar
-│   ├── api.js                               # analyzeImage(): mock or real
-│   ├── config.js                            # Single source of config / env
-│   ├── App.jsx                              # App state machine
-│   ├── main.jsx                             # React entry point
-│   └── index.css                            # Styling (plain CSS)
-├── staticwebapp.config.json                # Azure SWA routing + headers
+│   │   ├── UploadForm.jsx     # Drag & drop + validation
+│   │   └── ResultCard.jsx     # Label + confidence bar
+│   ├── api.js                 # analyzeImage(): mock or real
+│   ├── config.js              # Single source of config / env
+│   ├── App.jsx                # App state machine
+│   ├── main.jsx               # React entry point
+│   └── index.css             # Styling (plain CSS)
+├── firebase.json              # Firebase Hosting config (serves dist/, SPA routing)
+├── .firebaserc                # Firebase project alias
 ├── index.html
 ├── vite.config.js
 └── package.json
