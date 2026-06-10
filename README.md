@@ -1,5 +1,7 @@
 # AI Image Detector — Frontend
 
+[AI-Image-Detector](https://ai-image-detector-6a4ef.web.app/)
+
 Web frontend for detecting AI-generated images. The user uploads an image and
 receives a verdict (**Real** / **AI-generated**) with a confidence score.
 
