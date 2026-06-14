@@ -1,23 +1,24 @@
 """
-Etap 2 — Przygotowanie danych (ArtiFact) jako pojedynczy skrypt.
+Etap 2 (wersja wielozrodlowa) — Przygotowanie danych: ArtiFact + COCOAI + OpenFake.
 
-Robi: pobranie ArtiFact z Hugging Face -> indeks -> cap per generator ->
-balans 50/50 -> stratyfikowany split -> zapis manifestow train/val/test.csv.
+Cel: zbudowac zbalansowany (50/50 Real vs AI), zroznicowany generatorowo zbior z TRZECH zrodel,
+ujednolicic do rozdzielczosci 200 px i zapisac manifesty train/val/test + osobny test_heldout
+(generalizacja na generator NIE widziany w treningu).
 
-Uzycie:
-    # 1) zaleznosci (raz):
-    pip install -U "huggingface_hub>=0.23" pandas scikit-learn pillow
+Zrodla i ich rola:
+  - ArtiFact (bitmind/ArtiFact)      : generatory 2023 (GAN + wczesne diffusion). Pliki na dysku.
+  - COCOAI   (Defactify_Image_Dataset): SD2.1/SDXL/SD3/DALLE3/MJ6, realne z COCO. Parquet (96k, ~7.5 GB).
+  - OpenFake (ComplexDataLab/OpenFake): NAJNOWSZE (FLUX, MJ6/7, GPT-Image-1, SD3.5, Imagen...). Parquet.
+                                        UWAGA: calosc = 1.06 TB -> STRUMIENIUJEMY podzbior, nie pobieramy calosci.
 
-    # 2a) w Google Colab — najpierw zamontuj Drive w KOMORCE notebooka:
-    #     from google.colab import drive; drive.mount('/content/drive')
-    #     a potem:  !python ml/prepare_data.py
-    #
-    # 2b) lokalnie — wskaz wlasny katalog:
-    #     python ml/prepare_data.py --data-root /sciezka/do/ai-image-detector
+Wspolny manifest ma kolumny: path, label (0=real/1=fake), generator, source.
 
-Parametry (--help pokazuje wszystkie) maja domyslne wartosci uzgodnione w tabeli.
-Funkcje build_transforms() i ArtifactDataset sa importowalne w treningu (Etap 3):
-    from ml.prepare_data import build_transforms, ArtifactDataset
+Uzycie (w Colab, po zamontowaniu Drive):
+    pip install -U "huggingface_hub>=0.23" datasets pandas scikit-learn pillow
+    python ml/prepare_data.py
+Najwazniejsze parametry: --holdout (generator wykluczony z treningu), --modern-per-gen-cap, --skip-*.
+
+Funkcje build_transforms() i ArtifactDataset (na dole) sa importowalne w treningu (Etap 3).
 """
 import os
 import glob
@@ -29,126 +30,247 @@ import pandas as pd
 
 
 # --------------------------------------------------------------------------- #
-# 1. Konfiguracja / argumenty
+# Konfiguracja
 # --------------------------------------------------------------------------- #
 def parse_args():
-    p = argparse.ArgumentParser(description="Przygotowanie danych ArtiFact -> manifesty CSV")
-    p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector",
-                   help="Glowny katalog projektu (na Drive lub lokalnie)")
-    p.add_argument("--img-size", type=int, default=224, help="Wejscie modelu (ViT/EffNet=224)")
-    p.add_argument("--per-gen-cap", type=int, default=20000, help="Max obrazow na generator")
-    p.add_argument("--n-train", type=int, default=80000, help="Obrazy treningowe na klase")
-    p.add_argument("--n-val",   type=int, default=10000, help="Obrazy walidacyjne na klase")
-    p.add_argument("--n-test",  type=int, default=10000, help="Obrazy testowe na klase")
+    p = argparse.ArgumentParser(description="Przygotowanie danych (ArtiFact + COCOAI + OpenFake)")
+    p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector")
+    p.add_argument("--save-size", type=int, default=200,
+                   help="Rozdzielczosc zapisu (ujednolicenie domeny; ArtiFact ma natywnie 200)")
+    p.add_argument("--img-size", type=int, default=224, help="Wejscie modelu (uzywane w transforms)")
+    # capy na generator (roznorodnosc)
+    p.add_argument("--artifact-cap", type=int, default=15000, help="Max obrazow na generator z ArtiFact")
+    p.add_argument("--modern-per-gen-cap", type=int, default=8000,
+                   help="Max obrazow na rodzine generatora z OpenFake/COCOAI")
+    p.add_argument("--openfake-real-cap", type=int, default=60000, help="Max realnych pobranych z OpenFake")
+    # budzety splitow (na klase)
+    p.add_argument("--n-train", type=int, default=80000)
+    p.add_argument("--n-val",   type=int, default=10000)
+    p.add_argument("--n-test",  type=int, default=10000)
+    # held-out: generator(y) WYKLUCZONE z treningu -> osobny test generalizacji
+    p.add_argument("--holdout", nargs="+", default=["imagen"],
+                   help="Rodziny generatorow trzymane wylacznie w test_heldout (np. imagen gpt-image)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--skip-download", action="store_true",
-                   help="Pomin pobieranie (gdy ArtiFact juz jest na dysku)")
+    # mozliwosc pominiecia ciezkich krokow przy ponownym uruchomieniu
+    p.add_argument("--skip-artifact", action="store_true")
+    p.add_argument("--skip-cocoai", action="store_true")
+    p.add_argument("--skip-openfake", action="store_true")
     return p.parse_args()
 
 
 # --------------------------------------------------------------------------- #
-# 3. Pobranie ArtiFact z Hugging Face
+# Narzedzia wspolne
 # --------------------------------------------------------------------------- #
-def download_artifact(artifact_dir):
-    from huggingface_hub import snapshot_download
-    print(f"[pobieranie] bitmind/ArtiFact -> {artifact_dir} (~31.7 GB, wznawialne)")
-    path = snapshot_download(
-        repo_id="bitmind/ArtiFact",
-        repo_type="dataset",
-        local_dir=artifact_dir,
-    )
-    print(f"[pobieranie] gotowe: {path}")
-    return path
+def save_resized(pil_img, out_path, size):
+    """Zapisuje obraz przeskalowany do size x size jako JPEG (ujednolicenie domeny + oszczednosc miejsca)."""
+    img = pil_img.convert("RGB").resize((size, size))
+    img.save(out_path, "JPEG", quality=95)
+
+
+def normalize_generator(model_name):
+    """Sprowadza dziesiatki wariantow (loRA/finetune) do RODZINY generatora — sensowny cap i held-out.
+    Np. 'sdxl-epic-realism' -> 'sdxl', 'flux.1-dev' -> 'flux', 'midjourney-6' -> 'midjourney'."""
+    m = str(model_name).lower()
+    families = [
+        ("flux", "flux"), ("midjourney", "midjourney"), ("dall", "dalle"), ("gpt-image", "gpt-image"),
+        ("imagen", "imagen"), ("ideogram", "ideogram"), ("grok", "grok"), ("hidream", "hidream"),
+        ("recraft", "recraft"), ("chroma", "chroma"), ("sd-3", "sd-3.5"), ("sd3", "sd-3.5"),
+        ("sdxl", "sdxl"), ("sd-2", "sd-2.1"), ("sd-1", "sd-1.5"), ("stable", "sdxl"),
+    ]
+    for key, fam in families:
+        if key in m:
+            return fam
+    return m  # fallback: oryginalna nazwa
 
 
 # --------------------------------------------------------------------------- #
-# 4. Budowa jednolitego indeksu z metadata.csv
+# 1. ArtiFact -> indeks (pliki juz na dysku)
 # --------------------------------------------------------------------------- #
-def build_index(artifact_dir):
+def prepare_artifact(data_root, skip):
+    artifact_dir = os.path.join(data_root, "artifact_raw")
+    if not skip:
+        from huggingface_hub import snapshot_download
+        print(f"[artifact] pobieranie bitmind/ArtiFact -> {artifact_dir} (~31.7 GB, wznawialne)")
+        snapshot_download(repo_id="bitmind/ArtiFact", repo_type="dataset", local_dir=artifact_dir)
+
     metas = glob.glob(os.path.join(artifact_dir, "**", "metadata.csv"), recursive=True)
     if not metas:
-        raise FileNotFoundError(
-            f"Brak metadata.csv w {artifact_dir}. Sprawdz strukture pobranych plikow "
-            "(foldery najwyzszego poziomu) i dostosuj parser.")
+        print("[artifact] UWAGA: brak metadata.csv — pomijam ArtiFact (sprawdz strukture).")
+        return pd.DataFrame(columns=["path", "label", "generator", "source"])
 
     rows = []
-    for m in metas:
-        folder = os.path.dirname(m)
-        generator = os.path.basename(folder)          # nazwa zrodla/generatora = nazwa folderu
-        df = pd.read_csv(m)
-        cols = {c.lower(): c for c in df.columns}      # standaryzacja nazw kolumn
-        path_col  = cols.get("image_path") or cols.get("path") or list(df.columns)[0]
-        label_col = cols.get("target") or cols.get("label")
+    for mfile in metas:
+        folder = os.path.dirname(mfile)
+        generator = os.path.basename(folder)
+        df = pd.read_csv(mfile)
+        cols = {c.lower(): c for c in df.columns}
+        pcol = cols.get("image_path") or cols.get("path") or list(df.columns)[0]
+        lcol = cols.get("target") or cols.get("label")
         for _, r in df.iterrows():
-            rows.append({
-                "path": os.path.join(folder, str(r[path_col])),
-                "label": int(r[label_col]),            # 0 = real, 1 = fake
-                "generator": generator,
-            })
-
-    index = pd.DataFrame(rows)
-    print(f"[indeks] obrazow: {len(index)} | klasy: {index.label.value_counts().to_dict()}")
-    print(f"[indeks] generatory: {index.generator.nunique()}")
-    return index
+            rows.append({"path": os.path.join(folder, str(r[pcol])),
+                         "label": int(r[lcol]), "generator": generator, "source": "artifact"})
+    out = pd.DataFrame(rows)
+    print(f"[artifact] obrazow: {len(out)} | klasy: {out.label.value_counts().to_dict()}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# 5. Cap per generator + balans 50/50
+# 2. COCOAI -> wypakowanie do plikow + indeks
 # --------------------------------------------------------------------------- #
-def cap_and_balance(index, per_gen_cap, budget_per_class, seed):
-    capped = (index.groupby("generator", group_keys=False)
-                   .apply(lambda g: g.sample(min(len(g), per_gen_cap), random_state=seed)))
-    real = capped[capped.label == 0]
-    fake = capped[capped.label == 1]
-    n = min(budget_per_class, len(real), len(fake))
-    if n < budget_per_class:
-        print(f"[balans] UWAGA: dostepne {n}/klasa < budzet {budget_per_class}. "
-              "Zwieksz --per-gen-cap lub zmniejsz N_*.")
-    real = real.sample(n, random_state=seed)
-    fake = fake.sample(n, random_state=seed)
-    balanced = pd.concat([real, fake]).sample(frac=1, random_state=seed).reset_index(drop=True)
-    print(f"[balans] zbior: {len(balanced)} | {balanced.label.value_counts().to_dict()}")
-    return balanced
+COCOAI_LABEL_B = {0: "real", 1: "sd-2.1", 2: "sdxl", 3: "sd-3.5", 4: "dalle", 5: "midjourney"}
+
+def prepare_cocoai(data_root, save_size, per_gen_cap, skip, seed):
+    out_dir = os.path.join(data_root, "cocoai_extracted")
+    manifest = os.path.join(out_dir, "_index.csv")
+    if skip and os.path.exists(manifest):
+        print("[cocoai] pomijam (uzywam istniejacego _index.csv)")
+        return pd.read_csv(manifest)
+
+    from datasets import load_dataset, concatenate_datasets
+    os.makedirs(out_dir, exist_ok=True)
+    print("[cocoai] load_dataset (96k, ~7.5 GB)...")
+    ds = load_dataset("Rajarshi-Roy-research/Defactify_Image_Dataset")
+    pool = concatenate_datasets([ds[s] for s in ds.keys()])  # laczymy wszystkie splity, podzielimy sami
+
+    counts, rows = {}, []
+    order = list(range(len(pool)))
+    random.Random(seed).shuffle(order)
+    for i in order:
+        ex = pool[i]
+        label = int(ex["Label_A"])                         # 0 real / 1 fake
+        gen = COCOAI_LABEL_B.get(int(ex["Label_B"]), "unknown")
+        key = "real" if label == 0 else gen
+        if counts.get(key, 0) >= per_gen_cap:              # cap per generator (i osobno realne)
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        path = os.path.join(out_dir, f"cocoai_{i}.jpg")
+        if not os.path.exists(path):
+            save_resized(ex["Image"], path, save_size)
+        rows.append({"path": path, "label": label, "generator": gen, "source": "cocoai"})
+    out = pd.DataFrame(rows)
+    out.to_csv(manifest, index=False)
+    print(f"[cocoai] zapisano: {len(out)} | per-bucket: {counts}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
-# 6. Stratyfikowany split + zapis manifestow
+# 3. OpenFake -> STRUMIENIOWO pobierany podzbior (calosc to 1.06 TB!)
 # --------------------------------------------------------------------------- #
-def split_and_save(balanced, manifest_dir, n_train, n_val, n_test, seed):
+def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, skip, seed):
+    out_dir = os.path.join(data_root, "openfake_extracted")
+    manifest = os.path.join(out_dir, "_index.csv")
+    if skip and os.path.exists(manifest):
+        print("[openfake] pomijam (uzywam istniejacego _index.csv)")
+        return pd.read_csv(manifest)
+
+    from datasets import load_dataset
+    os.makedirs(out_dir, exist_ok=True)
+    print("[openfake] streaming train (~1.87M wierszy) — pobieram tylko podzbior...")
+    stream = load_dataset("ComplexDataLab/OpenFake", split="train", streaming=True)
+    stream = stream.shuffle(seed=seed, buffer_size=10000)
+
+    counts, rows, seen = {}, [], 0
+    for ex in stream:
+        seen += 1
+        is_real = (str(ex["label"]).lower() == "real")
+        if is_real:
+            key, label, gen = "real", 0, "real"
+            cap = real_cap
+        else:
+            gen = normalize_generator(ex["model"])
+            key, label = gen, 1
+            cap = per_gen_cap
+        if counts.get(key, 0) >= cap:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        path = os.path.join(out_dir, f"openfake_{seen}.jpg")
+        if not os.path.exists(path):
+            save_resized(ex["image"], path, save_size)
+        rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
+        # warunek stopu: realne pelne i wszystkie znane rodziny powyzej capu (z marginesem na rzadkie)
+        if counts.get("real", 0) >= real_cap and seen > 400000:
+            break
+        if seen % 20000 == 0:
+            print(f"   ...przejrzano {seen}, zebrano {len(rows)} | buckety: {len(counts)}")
+    out = pd.DataFrame(rows)
+    out.to_csv(manifest, index=False)
+    print(f"[openfake] zapisano: {len(out)} | per-bucket: {counts}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 4. Laczenie, cap, balans, held-out, split
+# --------------------------------------------------------------------------- #
+def cap_per_generator(df, cap, seed):
+    return (df.groupby("generator", group_keys=False)
+              .apply(lambda g: g.sample(min(len(g), cap), random_state=seed)))
+
+
+def build_splits(index, args):
     from sklearn.model_selection import train_test_split
+    manifest_dir = os.path.join(args.data_root, "manifests")
     os.makedirs(manifest_dir, exist_ok=True)
 
-    balanced["strat"] = balanced.label.astype(str) + "_" + balanced.generator.astype(str)
-    total = n_train + n_val + n_test
-    test_frac = n_test / total
-    val_frac  = n_val / (n_train + n_val)
+    holdout = set(args.holdout)
+    # 1) HELD-OUT: fake z wykluczonych generatorow -> tylko test generalizacji (nigdy w treningu)
+    heldout_fake = index[(index.label == 1) & (index.generator.isin(holdout))]
+    pool = index[~((index.label == 1) & (index.generator.isin(holdout)))].copy()
 
-    trainval, test = train_test_split(
-        balanced, test_size=test_frac, stratify=balanced["strat"], random_state=seed)
-    train, val = train_test_split(
-        trainval, test_size=val_frac, stratify=trainval["strat"], random_state=seed)
+    # 2) cap per generator (na puli treningowej) + balans 50/50
+    capped = cap_per_generator(pool, args.modern_per_gen_cap, args.seed) \
+        if args.modern_per_gen_cap else pool
+    real = capped[capped.label == 0]
+    fake = capped[capped.label == 1]
+    budget = args.n_train + args.n_val + args.n_test
+    n = min(budget, len(real), len(fake))
+    if n < budget:
+        print(f"[split] UWAGA: dostepne {n}/klasa < budzet {budget}. Zmniejsz N_* lub zwieksz capy.")
+    real = real.sample(n, random_state=args.seed)
+    fake = fake.sample(n, random_state=args.seed)
+    balanced = pd.concat([real, fake]).sample(frac=1, random_state=args.seed).reset_index(drop=True)
 
-    for name, part in [("train", train), ("val", val), ("test", test)]:
+    # 3) stratyfikowany split po (klasa x generator x source)
+    balanced["strat"] = (balanced.label.astype(str) + "_" +
+                         balanced.generator.astype(str) + "_" + balanced.source.astype(str))
+    # rzadkie kombinacje psuja stratyfikacje -> sklejamy do "_rare"
+    vc = balanced["strat"].value_counts()
+    balanced.loc[balanced.strat.isin(vc[vc < 3].index), "strat"] = "_rare"
+
+    test_frac = args.n_test / budget
+    val_frac = args.n_val / (args.n_train + args.n_val)
+    trainval, test = train_test_split(balanced, test_size=test_frac,
+                                      stratify=balanced["strat"], random_state=args.seed)
+    train, val = train_test_split(trainval, test_size=val_frac,
+                                  stratify=trainval["strat"], random_state=args.seed)
+
+    # 4) test_heldout: balans z realnymi z puli testowej (zeby byl 50/50)
+    n_ho = min(len(heldout_fake), len(test[test.label == 0]))
+    heldout = pd.concat([
+        heldout_fake.sample(n_ho, random_state=args.seed),
+        test[test.label == 0].sample(n_ho, random_state=args.seed),
+    ]).sample(frac=1, random_state=args.seed)
+
+    cols = ["path", "label", "generator", "source"]
+    for name, part in [("train", train), ("val", val), ("test", test), ("test_heldout", heldout)]:
         out = os.path.join(manifest_dir, f"{name}.csv")
-        part[["path", "label", "generator"]].to_csv(out, index=False)
-        print(f"[split] {name}: {len(part):>6} | {part.label.value_counts().to_dict()} -> {out}")
+        part[cols].to_csv(out, index=False)
+        print(f"[split] {name:13s}: {len(part):>6} | klasy={part.label.value_counts().to_dict()}"
+              f" | generatory={part.generator.nunique()} -> {out}")
+    print(f"[split] held-out generatory (poza treningiem): {sorted(holdout)}")
 
 
 # --------------------------------------------------------------------------- #
-# 7. Preprocessing — importowalne w treningu (Etap 3)
+# 5. Preprocessing — importowalne w treningu (Etap 3)
 # --------------------------------------------------------------------------- #
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-
 def build_transforms(img_size=224):
-    """Zwraca (train_tf, eval_tf). Augmentacja umiarkowana — nie niszczy artefaktow generatora."""
     from torchvision import transforms
     train_tf = transforms.Compose([
         transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0)),
         transforms.RandomHorizontalFlip(0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-        # transforms.RandomApply([transforms.GaussianBlur(3)], p=0.1),  # opcjonalnie: robustnosc web
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
@@ -162,16 +284,14 @@ def build_transforms(img_size=224):
 
 
 class ArtifactDataset:
-    """Dataset PyTorch czytajacy obrazy z manifestu CSV (path, label, generator)."""
+    """Dataset PyTorch czytajacy obrazy z manifestu CSV (path, label, generator, source)."""
     def __init__(self, manifest_csv, transform):
         from PIL import Image
         self._Image = Image
         self.df = pd.read_csv(manifest_csv)
         self.transform = transform
-
     def __len__(self):
         return len(self.df)
-
     def __getitem__(self, i):
         row = self.df.iloc[i]
         img = self._Image.open(row["path"]).convert("RGB")
@@ -185,21 +305,21 @@ def main():
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    artifact_dir = os.path.join(args.data_root, "artifact_raw")
-    manifest_dir = os.path.join(args.data_root, "manifests")
     os.makedirs(args.data_root, exist_ok=True)
 
-    if not args.skip_download:
-        download_artifact(artifact_dir)
-    else:
-        print("[pobieranie] pominiete (--skip-download)")
+    parts = []
+    parts.append(prepare_artifact(args.data_root, args.skip_artifact))
+    parts.append(prepare_cocoai(args.data_root, args.save_size, args.modern_per_gen_cap,
+                                args.skip_cocoai, args.seed))
+    parts.append(prepare_openfake(args.data_root, args.save_size, args.modern_per_gen_cap,
+                                  args.openfake_real_cap, args.skip_openfake, args.seed))
 
-    index = build_index(artifact_dir)
-    budget = args.n_train + args.n_val + args.n_test
-    balanced = cap_and_balance(index, args.per_gen_cap, budget, args.seed)
-    split_and_save(balanced, manifest_dir, args.n_train, args.n_val, args.n_test, args.seed)
-    print("\nGotowe. Manifesty w:", manifest_dir)
+    index = pd.concat(parts, ignore_index=True)
+    print(f"\n[indeks] LACZNIE: {len(index)} | klasy={index.label.value_counts().to_dict()}")
+    print(index.groupby("source").size().to_dict())
+
+    build_splits(index, args)
+    print("\nGotowe. Manifesty w:", os.path.join(args.data_root, "manifests"))
 
 
 if __name__ == "__main__":
