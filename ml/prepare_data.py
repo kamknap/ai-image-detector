@@ -14,9 +14,10 @@ Zrodla i ich rola:
 Wspolny manifest ma kolumny: path, label (0=real/1=fake), generator, source.
 
 Uzycie (w Colab, po zamontowaniu Drive):
-    pip install -U "huggingface_hub>=0.23" datasets pandas scikit-learn pillow
+    pip install -U "huggingface_hub>=0.23" datasets "pandas==2.2.2" "pillow<12.0" scikit-learn
     python ml/prepare_data.py
-Najwazniejsze parametry: --holdout (generator wykluczony z treningu), --modern-per-gen-cap, --skip-*.
+Najwazniejsze parametry: --holdout (generator wykluczony z treningu), --modern-per-gen-cap, --skip-*,
+--data-root (gdzie zapisac dane na Drive), --openfake-max-scan (limit czasu/transferu OpenFake).
 
 Funkcje build_transforms() i ArtifactDataset (na dole) sa importowalne w treningu (Etap 3).
 """
@@ -34,7 +35,8 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser(description="Przygotowanie danych (ArtiFact + COCOAI + OpenFake)")
-    p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector")
+    p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector",
+                   help="Glowny katalog projektu na Drive. Wszystkie dane laduja w jego podfolderach.")
     p.add_argument("--save-size", type=int, default=200,
                    help="Rozdzielczosc zapisu (ujednolicenie domeny; ArtiFact ma natywnie 200)")
     p.add_argument("--img-size", type=int, default=224, help="Wejscie modelu (uzywane w transforms)")
@@ -43,6 +45,8 @@ def parse_args():
     p.add_argument("--modern-per-gen-cap", type=int, default=8000,
                    help="Max obrazow na rodzine generatora z OpenFake/COCOAI")
     p.add_argument("--openfake-real-cap", type=int, default=60000, help="Max realnych pobranych z OpenFake")
+    p.add_argument("--openfake-max-scan", type=int, default=120000,
+                   help="Limit wierszy strumienia OpenFake do przejrzenia (ogranicza czas i transfer)")
     # budzety splitow (na klase)
     p.add_argument("--n-train", type=int, default=80000)
     p.add_argument("--n-val",   type=int, default=10000)
@@ -156,7 +160,7 @@ def prepare_cocoai(data_root, save_size, per_gen_cap, skip, seed):
 # --------------------------------------------------------------------------- #
 # 3. OpenFake -> STRUMIENIOWO pobierany podzbior (calosc to 1.06 TB!)
 # --------------------------------------------------------------------------- #
-def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, skip, seed):
+def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip, seed):
     out_dir = os.path.join(data_root, "openfake_extracted")
     manifest = os.path.join(out_dir, "_index.csv")
     if skip and os.path.exists(manifest):
@@ -165,36 +169,35 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, skip, seed):
 
     from datasets import load_dataset
     os.makedirs(out_dir, exist_ok=True)
-    print("[openfake] streaming train (~1.87M wierszy) — pobieram tylko podzbior...")
-    stream = load_dataset("ComplexDataLab/OpenFake", split="train", streaming=True)
-    stream = stream.shuffle(seed=seed, buffer_size=10000)
+    print(f"[openfake] streaming 'core' — czytam sekwencyjnie max {max_scan} wierszy "
+          f"(dane sa juz wymieszane). Postep co 2000:")
+    # OpenFake wymaga nazwy konfiguracji: 'core' = glowny wyselekcjonowany zbior (ten chcemy),
+    # 'reddit' = dodatkowe realne zdjecia. Bez tego load_dataset rzuca "Config name is missing".
+    # BEZ .shuffle() — duzy bufor blokowalby start na kilka GB; 'core' jest juz wymieszany.
+    stream = load_dataset("ComplexDataLab/OpenFake", "core", split="train", streaming=True)
 
     counts, rows, seen = {}, [], 0
     for ex in stream:
         seen += 1
         is_real = (str(ex["label"]).lower() == "real")
         if is_real:
-            key, label, gen = "real", 0, "real"
-            cap = real_cap
+            key, label, gen, cap = "real", 0, "real", real_cap
         else:
             gen = normalize_generator(ex["model"])
-            key, label = gen, 1
-            cap = per_gen_cap
-        if counts.get(key, 0) >= cap:
-            continue
-        counts[key] = counts.get(key, 0) + 1
-        path = os.path.join(out_dir, f"openfake_{seen}.jpg")
-        if not os.path.exists(path):
-            save_resized(ex["image"], path, save_size)
-        rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
-        # warunek stopu: realne pelne i wszystkie znane rodziny powyzej capu (z marginesem na rzadkie)
-        if counts.get("real", 0) >= real_cap and seen > 400000:
+            key, label, cap = gen, 1, per_gen_cap
+        if counts.get(key, 0) < cap:
+            counts[key] = counts.get(key, 0) + 1
+            path = os.path.join(out_dir, f"openfake_{seen}.jpg")
+            if not os.path.exists(path):
+                save_resized(ex["image"], path, save_size)
+            rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
+        if seen % 2000 == 0:
+            print(f"   ...przejrzano {seen}, zebrano {len(rows)} | rodzin: {len(counts)}")
+        if seen >= max_scan:   # twardy limit -> krok zawsze sie konczy
             break
-        if seen % 20000 == 0:
-            print(f"   ...przejrzano {seen}, zebrano {len(rows)} | buckety: {len(counts)}")
     out = pd.DataFrame(rows)
     out.to_csv(manifest, index=False)
-    print(f"[openfake] zapisano: {len(out)} | per-bucket: {counts}")
+    print(f"[openfake] zapisano: {len(out)} (przejrzano {seen}) | per-bucket: {counts}")
     return out
 
 
@@ -306,13 +309,16 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     os.makedirs(args.data_root, exist_ok=True)
+    print(f"[info] Wszystkie dane zapisuje w: {args.data_root}")
+    print(f"[info] Podfoldery: artifact_raw/ cocoai_extracted/ openfake_extracted/ manifests/\n")
 
     parts = []
     parts.append(prepare_artifact(args.data_root, args.skip_artifact))
     parts.append(prepare_cocoai(args.data_root, args.save_size, args.modern_per_gen_cap,
                                 args.skip_cocoai, args.seed))
     parts.append(prepare_openfake(args.data_root, args.save_size, args.modern_per_gen_cap,
-                                  args.openfake_real_cap, args.skip_openfake, args.seed))
+                                  args.openfake_real_cap, args.openfake_max_scan,
+                                  args.skip_openfake, args.seed))
 
     index = pd.concat(parts, ignore_index=True)
     print(f"\n[indeks] LACZNIE: {len(index)} | klasy={index.label.value_counts().to_dict()}")

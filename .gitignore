@@ -22,3 +22,8 @@ npm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Python (ML)
+__pycache__/
+*.pyc
+*.pyo
