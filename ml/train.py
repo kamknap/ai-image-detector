@@ -48,6 +48,8 @@ def parse_args():
     p.add_argument("--patience", type=int, default=3, help="Early stopping: ile epok bez poprawy val-loss")
     p.add_argument("--cache-local", action="store_true",
                    help="Skopiuj obrazy z Drive na lokalny dysk Colaba (duzo szybsze epoki)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="Szybki test: ogranicz liczbe obrazow na split (np. 4000). 0 = caly zbior")
     p.add_argument("--out-subdir", default="models")
     return p.parse_args()
 
@@ -69,12 +71,13 @@ def maybe_cache_local(df, data_root, enable):
     return df
 
 
-def make_loader(manifest, transform, data_root, cache, batch_size, workers, shuffle):
+def make_loader(manifest, transform, data_root, cache, limit, batch_size, workers, shuffle):
     df = pd.read_csv(manifest)
-    df = maybe_cache_local(df, data_root, cache)
-    tmp = manifest + ".cache.csv" if cache else manifest
-    if cache:
-        df.to_csv(tmp, index=False)        # ArtifactDataset czyta z CSV -> zapisujemy przepisane sciezki
+    df = maybe_cache_local(df, data_root, cache)       # ew. przepisanie sciezek na lokalne
+    if limit and limit > 0:                            # szybki test na wycinku
+        df = df.sample(min(limit, len(df)), random_state=42).reset_index(drop=True)
+    tmp = manifest + ".run.csv"                         # ArtifactDataset czyta z CSV
+    df.to_csv(tmp, index=False)
     ds = ArtifactDataset(tmp, transform)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=workers, pin_memory=True), len(ds)
@@ -125,9 +128,9 @@ def main():
 
     train_tf, eval_tf = build_transforms(args.img_size)
     train_dl, n_tr = make_loader(os.path.join(man, "train.csv"), train_tf, args.data_root,
-                                 args.cache_local, args.batch_size, args.num_workers, True)
+                                 args.cache_local, args.limit, args.batch_size, args.num_workers, True)
     val_dl, n_va = make_loader(os.path.join(man, "val.csv"), eval_tf, args.data_root,
-                               args.cache_local, args.batch_size, args.num_workers, False)
+                               args.cache_local, args.limit, args.batch_size, args.num_workers, False)
     print(f"[dane] train={n_tr}  val={n_va}  | batch={args.batch_size}")
 
     model = build_model(device)
