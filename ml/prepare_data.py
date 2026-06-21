@@ -167,7 +167,10 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip
         print("[openfake] pomijam (uzywam istniejacego _index.csv)")
         return pd.read_csv(manifest)
 
-    from datasets import load_dataset
+    import io
+    from PIL import Image, ImageFile
+    from datasets import load_dataset, Image as HFImage
+    ImageFile.LOAD_TRUNCATED_IMAGES = True   # toleruj lekko uciete pliki
     os.makedirs(out_dir, exist_ok=True)
     print(f"[openfake] streaming 'core' — czytam sekwencyjnie max {max_scan} wierszy "
           f"(dane sa juz wymieszane). Postep co 2000:")
@@ -175,8 +178,11 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip
     # 'reddit' = dodatkowe realne zdjecia. Bez tego load_dataset rzuca "Config name is missing".
     # BEZ .shuffle() — duzy bufor blokowalby start na kilka GB; 'core' jest juz wymieszany.
     stream = load_dataset("ComplexDataLab/OpenFake", "core", split="train", streaming=True)
+    # decode=False -> 'datasets' NIE dekoduje obrazu automatycznie (omija bug PIL.getexif na
+    # uszkodzonym EXIF, ktory wywalal caly proces). Surowe bajty otwieramy sami, z obsluga bledow.
+    stream = stream.cast_column("image", HFImage(decode=False))
 
-    counts, rows, seen = {}, [], 0
+    counts, rows, seen, bad = {}, [], 0, 0
     for ex in stream:
         seen += 1
         is_real = (str(ex["label"]).lower() == "real")
@@ -186,18 +192,22 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip
             gen = normalize_generator(ex["model"])
             key, label, cap = gen, 1, per_gen_cap
         if counts.get(key, 0) < cap:
-            counts[key] = counts.get(key, 0) + 1
             path = os.path.join(out_dir, f"openfake_{seen}.jpg")
-            if not os.path.exists(path):
-                save_resized(ex["image"], path, save_size)
-            rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
+            try:
+                if not os.path.exists(path):
+                    img = Image.open(io.BytesIO(ex["image"]["bytes"]))
+                    save_resized(img, path, save_size)
+                counts[key] = counts.get(key, 0) + 1     # licz dopiero po udanym zapisie
+                rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
+            except Exception:
+                bad += 1                                 # uszkodzony obraz -> pomijamy, nie przerywamy
         if seen % 2000 == 0:
-            print(f"   ...przejrzano {seen}, zebrano {len(rows)} | rodzin: {len(counts)}")
+            print(f"   ...przejrzano {seen}, zebrano {len(rows)}, pominieto {bad} | rodzin: {len(counts)}")
         if seen >= max_scan:   # twardy limit -> krok zawsze sie konczy
             break
     out = pd.DataFrame(rows)
     out.to_csv(manifest, index=False)
-    print(f"[openfake] zapisano: {len(out)} (przejrzano {seen}) | per-bucket: {counts}")
+    print(f"[openfake] zapisano: {len(out)} (przejrzano {seen}, pominieto {bad}) | per-bucket: {counts}")
     return out
 
 
