@@ -215,8 +215,9 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip
 # 4. Laczenie, cap, balans, held-out, split
 # --------------------------------------------------------------------------- #
 def cap_per_generator(df, cap, seed):
-    return (df.groupby("generator", group_keys=False)
-              .apply(lambda g: g.sample(min(len(g), cap), random_state=seed)))
+    # losowe podprobkowanie do `cap` na generator (bez deprecated apply-on-grouping-columns)
+    parts = [g.sample(min(len(g), cap), random_state=seed) for _, g in df.groupby("generator")]
+    return pd.concat(parts).reset_index(drop=True) if parts else df
 
 
 def build_splits(index, args):
@@ -229,11 +230,13 @@ def build_splits(index, args):
     heldout_fake = index[(index.label == 1) & (index.generator.isin(holdout))]
     pool = index[~((index.label == 1) & (index.generator.isin(holdout)))].copy()
 
-    # 2) cap per generator (na puli treningowej) + balans 50/50
-    capped = cap_per_generator(pool, args.modern_per_gen_cap, args.seed) \
-        if args.modern_per_gen_cap else pool
-    real = capped[capped.label == 0]
-    fake = capped[capped.label == 1]
+    # 2) cap per generator TYLKO dla fake (zeby zaden generator nie dominowal);
+    #    realnych NIE capujemy per-generator — wszystkie maja generator="real"/zrodlo,
+    #    wiec cap zlepialby je w jeden kubelek. Balans 50/50 i tak nastepuje nizej.
+    real = pool[pool.label == 0]
+    fake = pool[pool.label == 1]
+    if args.modern_per_gen_cap:
+        fake = cap_per_generator(fake, args.modern_per_gen_cap, args.seed)
     budget = args.n_train + args.n_val + args.n_test
     n = min(budget, len(real), len(fake))
     if n < budget:
