@@ -50,6 +50,13 @@ def parse_args():
                    help="Skopiuj obrazy z Drive na lokalny dysk Colaba (duzo szybsze epoki)")
     p.add_argument("--limit", type=int, default=0,
                    help="Szybki test: ogranicz liczbe obrazow na split (np. 4000). 0 = caly zbior")
+    # --- przelaczniki ablacyjne (badanie wplywu czynnikow na jakosc) ---
+    p.add_argument("--no-aug", action="store_true",
+                   help="ABLACJA: wylacz augmentacje (trening na transform jak walidacja)")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="ABLACJA: trenuj od zera, bez wag ImageNet (bez uczenia transferowego)")
+    p.add_argument("--tag", default="",
+                   help="Sufiks nazw plikow wynikowych, by oddzielic biegi ablacyjne (np. _noaug)")
     p.add_argument("--out-subdir", default="models")
     return p.parse_args()
 
@@ -83,9 +90,10 @@ def make_loader(manifest, transform, data_root, cache, limit, batch_size, worker
                       num_workers=workers, pin_memory=True), len(ds)
 
 
-def build_model(device):
-    # EfficientNet-B0 z wagami ImageNet (transfer learning)
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+def build_model(device, pretrained=True):
+    # EfficientNet-B0; pretrained=True -> wagi ImageNet (uczenie transferowe), False -> od zera (ablacja)
+    weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+    model = models.efficientnet_b0(weights=weights)
     # podmiana glowicy: oryginalnie 1000 klas ImageNet -> 2 klasy (Real=0, AI=1)
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, 2)
@@ -127,20 +135,26 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     train_tf, eval_tf = build_transforms(args.img_size)
+    if args.no_aug:                         # ablacja: trening bez augmentacji
+        train_tf = eval_tf
+    print(f"[konfig] augmentacja={'NIE' if args.no_aug else 'TAK'} | "
+          f"pretrained(ImageNet)={'NIE' if args.no_pretrained else 'TAK'} | tag='{args.tag}'")
     train_dl, n_tr = make_loader(os.path.join(man, "train.csv"), train_tf, args.data_root,
                                  args.cache_local, args.limit, args.batch_size, args.num_workers, True)
     val_dl, n_va = make_loader(os.path.join(man, "val.csv"), eval_tf, args.data_root,
                                args.cache_local, args.limit, args.batch_size, args.num_workers, False)
     print(f"[dane] train={n_tr}  val={n_va}  | batch={args.batch_size}")
 
-    model = build_model(device)
+    model = build_model(device, pretrained=not args.no_pretrained)
     criterion = nn.CrossEntropyLoss()                 # 2 wyjscia + softmax; klasy 50/50 -> bez wag
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     history, best_val, no_improve = [], float("inf"), 0
-    best_path = os.path.join(out_dir, "efficientnet_b0_best.pt")
+    best_path = os.path.join(out_dir, f"efficientnet_b0_best{args.tag}.pt")
+    last_path = os.path.join(out_dir, f"last{args.tag}.pt")
+    hist_path = os.path.join(out_dir, f"history{args.tag}.json")
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -152,12 +166,11 @@ def main():
               f"val_loss={va_loss:.4f} acc={va_acc:.4f} | {dt:.0f}s")
         history.append({"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc,
                         "val_loss": va_loss, "val_acc": va_acc})
-        json.dump(history, open(os.path.join(out_dir, "history.json"), "w"), indent=2)
+        json.dump(history, open(hist_path, "w"), indent=2)
 
         # checkpoint na Drive co epoke (zabezpieczenie przed rozlaczeniem Colaba)
         torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                    "val_acc": va_acc, "classes": {0: "real", 1: "ai"}},
-                   os.path.join(out_dir, "last.pt"))
+                    "val_acc": va_acc, "classes": {0: "real", 1: "ai"}}, last_path)
 
         # zapis najlepszego wg val-loss + early stopping
         if va_loss < best_val:

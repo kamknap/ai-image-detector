@@ -300,17 +300,39 @@ def build_transforms(img_size=224):
 
 
 class ArtifactDataset:
-    """Dataset PyTorch czytajacy obrazy z manifestu CSV (path, label, generator, source)."""
+    """Dataset PyTorch czytajacy obrazy z manifestu CSV (path, label, generator, source).
+
+    Odczyt z Google Drive (montowany przez FUSE) bywa zawodny przy wielu malych plikach:
+    zdarza sie PRZEJSCIOWY 'OSError: [Errno 5] Input/output error', mimo ze plik jest OK.
+    Dlatego kazdy odczyt ma kilka prob z rosnaca pauza; dopiero potem zglaszamy blad
+    (z pelna sciezka, zeby dalo sie zdiagnozowac naprawde uszkodzony plik)."""
+    RETRIES = 4        # liczba prob odczytu
+    RETRY_WAIT = 1.5   # bazowa pauza [s]; rosnie liniowo: 1.5s, 3s, 4.5s...
+
     def __init__(self, manifest_csv, transform):
         from PIL import Image
         self._Image = Image
         self.df = pd.read_csv(manifest_csv)
         self.transform = transform
+
     def __len__(self):
         return len(self.df)
+
+    def _open_with_retry(self, path):
+        import time
+        last_err = None
+        for attempt in range(self.RETRIES):
+            try:
+                return self._Image.open(path).convert("RGB")
+            except OSError as e:
+                last_err = e
+                time.sleep(self.RETRY_WAIT * (attempt + 1))
+        raise OSError(f"Nie udalo sie odczytac '{path}' po {self.RETRIES} probach "
+                      f"(ostatni blad: {last_err})") from last_err
+
     def __getitem__(self, i):
         row = self.df.iloc[i]
-        img = self._Image.open(row["path"]).convert("RGB")
+        img = self._open_with_retry(row["path"])
         return self.transform(img), int(row["label"])
 
 
