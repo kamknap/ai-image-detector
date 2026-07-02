@@ -61,18 +61,46 @@ def parse_args():
     return p.parse_args()
 
 
+CACHE_SUBDIRS = ["cocoai_extracted", "openfake_extracted", "artifact_raw"]
+
 def maybe_cache_local(df, data_root, enable):
-    """Drive jest wolny przy odczycie 100k+ malych plikow co epoke. Kopia raz na lokalny dysk
-    Colaba (~1-2 GB) bardzo przyspiesza trening. Przepisujemy sciezki w manifescie."""
+    """Drive (FUSE) jest bardzo wolny przy odczycie dziesiatek tysiecy malych plikow.
+    Strategia dwupoziomowa:
+      - Jesli na Drive istnieje archiwum aidata_images.tar -> kopiujemy JEDEN duzy plik
+        (szybkie, minuty) i rozpakowujemy lokalnie.
+      - Jesli nie -> jednorazowo kopiujemy pliki pojedynczo (wolne, godziny), po czym
+        budujemy tar z kopii lokalnej i odkladamy na Drive, zeby KazDA kolejna sesja
+        (restart po rozlaczeniu, ablacje, eval, ViT) startowala w minuty.
+    Przepisujemy sciezki w manifescie na lokalne."""
     if not enable:
         return df
     import shutil
+    import subprocess
     local = "/content/aidata"
-    for sub in ["cocoai_extracted", "openfake_extracted", "artifact_raw"]:
-        src, dst = os.path.join(data_root, sub), os.path.join(local, sub)
-        if os.path.isdir(src) and not os.path.isdir(dst):
-            print(f"[cache] kopiuje {sub} -> dysk lokalny (jednorazowo)...")
-            shutil.copytree(src, dst)
+    archive = os.path.join(data_root, "aidata_images.tar")
+    if not os.path.isdir(local):
+        os.makedirs(local, exist_ok=True)
+        if os.path.exists(archive):
+            print("[cache] znaleziono aidata_images.tar — kopiuje archiwum z Drive (minuty)...")
+            tmp = "/content/aidata_images.tar"
+            shutil.copyfile(archive, tmp)
+            print("[cache] rozpakowuje lokalnie...")
+            subprocess.run(["tar", "-xf", tmp, "-C", local], check=True)
+            os.remove(tmp)
+        else:
+            for sub in CACHE_SUBDIRS:
+                src, dst = os.path.join(data_root, sub), os.path.join(local, sub)
+                if os.path.isdir(src) and not os.path.isdir(dst):
+                    print(f"[cache] kopiuje {sub} -> dysk lokalny (jednorazowo, WOLNE)...")
+                    shutil.copytree(src, dst)
+            present = [s for s in CACHE_SUBDIRS if os.path.isdir(os.path.join(local, s))]
+            print("[cache] buduje aidata_images.tar z kopii lokalnej i odkladam na Drive "
+                  "(jednorazowo; przyspieszy kazda kolejna sesje)...")
+            tmp = "/content/aidata_images.tar"
+            subprocess.run(["tar", "-cf", tmp, "-C", local] + present, check=True)
+            shutil.copyfile(tmp, archive)
+            os.remove(tmp)
+            print(f"[cache] archiwum zapisane: {archive}")
     df = df.copy()
     df["path"] = df["path"].str.replace(data_root, local, regex=False)
     return df
