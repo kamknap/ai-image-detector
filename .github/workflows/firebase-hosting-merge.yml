@@ -6,6 +6,13 @@ on:
   push:
     branches:
       - main
+    # Deploy frontendu tylko przy zmianach frontendu. Zmiany w ml/ i docs/ nie
+    # wplywaja na hosting — proba ponownego wydania identycznej wersji konczyla
+    # sie bledem "is the current active version".
+    paths-ignore:
+      - "ml/**"
+      - "docs/**"
+      - "**.md"
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest

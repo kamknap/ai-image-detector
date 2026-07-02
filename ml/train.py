@@ -184,7 +184,7 @@ def main():
                 print(f"[early stopping] brak poprawy od {args.patience} epok — przerywam.")
                 break
 
-    print(f"\nGotowe. Najlepszy model: {best_path} | historia: {out_dir}/history.json")
+    print(f"\nGotowe. Najlepszy model: {best_path} | historia: {hist_path}")
 
 
 if __name__ == "__main__":
