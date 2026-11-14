@@ -13,9 +13,9 @@ Co robi:
      - predictions_<zbior>.csv     (path, label, prob — do dalszych analiz, np. progu)
      - confusion_<zbior>.png, roc_<zbior>.png (wykresy do rozdzialu wynikow)
 
-Uzycie (Colab, po treningu):
-    !python ml/eval.py --cache-local                 # domyslny checkpoint (best)
-    !python ml/eval.py --checkpoint models/efficientnet_b0_best_noaug.pt --tag _noaug
+Uzycie (Colab, po treningu; dane rozpakowywane z aidata_images.tar jak w treningu):
+    !python ml/eval.py                               # domyslny checkpoint (best)
+    !python ml/eval.py --tag _noaug                  # checkpoint biegu ablacyjnego
 """
 import os
 import sys
@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prepare_data import build_transforms, ArtifactDataset
-from train import build_model, maybe_cache_local
+from train import build_model, prepare_image_root, manifest_dir
 
 
 def parse_args():
@@ -37,29 +37,30 @@ def parse_args():
     p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector")
     p.add_argument("--checkpoint", default="",
                    help="Sciezka do checkpointu .pt (domyslnie: models/efficientnet_b0_best<tag>.pt)")
-    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--local-root", default="/content/aidata")
+    p.add_argument("--img-size", type=int, default=0,
+                   help="0 = wez z checkpointu (ta sama rozdzielczosc co w treningu)")
     p.add_argument("--batch-size", type=int, default=128, help="Bez gradientow miesci sie wiecej niz w treningu")
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--cache-local", action="store_true", help="Kopia obrazow na dysk lokalny (jak w treningu)")
+    p.add_argument("--no-cache", action="store_true", help="Czytaj obrazy prosto z Drive (WOLNE)")
+    p.add_argument("--cache-local", action="store_true", help=argparse.SUPPRESS)  # zgodnosc wstecz
     p.add_argument("--tag", default="", help="Sufiks biegu (spojny z --tag z treningu)")
     return p.parse_args()
 
 
 @torch.no_grad()
-def predict(model, manifest, transform, args, device):
+def predict(model, manifest, transform, image_root, args, device):
     """Zwraca DataFrame z manifestu + kolumny prob (P(fake)) i pred (0/1).
     Kolejnosc wierszy odpowiada manifestowi (shuffle=False), wiec mozemy je skleic 1:1."""
     df = pd.read_csv(manifest)
-    df = maybe_cache_local(df, args.data_root, args.cache_local)
-    tmp = manifest + ".eval.csv"
-    df.to_csv(tmp, index=False)
-    dl = DataLoader(ArtifactDataset(tmp, transform), batch_size=args.batch_size,
-                    shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    dl = DataLoader(ArtifactDataset(df, transform, root=image_root), batch_size=args.batch_size,
+                    shuffle=False, num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
     model.eval()
     probs = []
     for x, _ in dl:
         x = x.to(device, non_blocking=True)
-        out = model(x)                                  # logity [B, 2]
+        with torch.autocast(device_type="cuda", enabled=(device == "cuda")):
+            out = model(x)                              # logity [B, 2]
         p = torch.softmax(out, dim=1)[:, 1]             # P(klasa 1 = fake) — nasz confidence score
         probs.append(p.float().cpu().numpy())
     df["prob"] = np.concatenate(probs)
@@ -138,17 +139,20 @@ def main():
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     model = build_model(device, pretrained=False)
     model.load_state_dict(ckpt["model_state"])
-    print(f"[info] checkpoint z epoki {ckpt.get('epoch')} | val_acc={ckpt.get('val_acc'):.4f}")
+    img_size = args.img_size or ckpt.get("img_size", 224)
+    print(f"[info] checkpoint z epoki {ckpt.get('epoch')} | val_acc={ckpt.get('val_acc'):.4f} "
+          f"| img_size={img_size}")
 
-    _, eval_tf = build_transforms(args.img_size)        # transform walidacyjny (bez augmentacji!)
-    man = os.path.join(args.data_root, "manifests")
+    _, eval_tf = build_transforms(img_size)             # transform walidacyjny (bez augmentacji!)
+    image_root = prepare_image_root(args.data_root, args.local_root, args.no_cache)
+    man = manifest_dir(image_root, args.data_root)
 
     for name in ["test", "test_heldout"]:
         manifest = os.path.join(man, f"{name}.csv")
         if not os.path.exists(manifest):
             print(f"[{name}] brak manifestu — pomijam"); continue
         print(f"\n=== {name} ===")
-        df = predict(model, manifest, eval_tf, args, device)
+        df = predict(model, manifest, eval_tf, image_root, args, device)
         m = compute_metrics(df)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()},
                          indent=2, ensure_ascii=False))

@@ -100,3 +100,20 @@ podzbiór), `Rajarshi-Roy-research/Defactify_Image_Dataset` (COCOAI). **ArtiFact
 Przeczytaj `docs/metodologia-i-postep.md` oraz `ml/prepare_data.py` i `ml/train.py`, potwierdź Kamilowi,
 że masz kontekst, i zaproponuj kontynuację od punktu 1 (uruchomienie/weryfikacja treningu) lub — jeśli
 trening już przeszedł — od Etapu 4 (ewaluacja). Trzymaj styl: po polsku, iteracyjnie, z wyjaśnieniami.
+
+---
+
+## Aktualizacja 2026-11-14 (WAŻNE — nadpisuje część informacji powyżej)
+
+- **Liczności z sekcji „Kluczowe fakty” (103k train, 1820 held-out) są NIEAKTUALNE.** Bieg ze skanem 120k OpenFake
+  nie zapisał się trwale na Drive (asynchroniczna synchronizacja Drive + rozłączenie sesji). Na Drive było tylko
+  40k OpenFake + 48k COCOAI → manifesty 44 560 / 5 571 / 5 571 / 644 (tylko 322 Imagen w held-out).
+- **Nowy workflow danych:** obrazy budowane na dysku lokalnym Colaba, na Drive tylko archiwa:
+  `python ml/prepare_data.py --skip-artifact --work-dir /content/aidata`
+  → `aidata_images.tar` (obrazy + manifesty, ścieżki WZGLĘDNE) + `parts/<źródło>.tar` (checkpoint po każdym źródle;
+  ponowne uruchomienie po rozłączeniu odtwarza gotowe źródła). Na koniec sesji: `drive.flush_and_unmount()`.
+- `train.py` / `eval.py` same rozpakowują archiwum do `/content/aidata` (flaga `--cache-local` niepotrzebna;
+  `--no-cache` = stary odczyt z Drive). Nowe: `--seed`, `--resume`, `config<tag>.json`, `img_size` w checkpoincie.
+- Transform ewaluacyjny: pełny obraz `Resize((s, s))` zamiast Resize 1.14× + CenterCrop (obrazy są kwadratowe 200 px).
+- Smoke test (2.07.2026, stary kod, odczyt z Drive): val_acc 0.80 po 1 epoce na 4k obrazów, ale ~5 obr./s przez Drive.
+- Do decyzji: `--img-size 200` (bez interpolacji) vs 224 (domyślne).

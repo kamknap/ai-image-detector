@@ -12,19 +12,30 @@ Zrodla i ich rola:
                                         UWAGA: calosc = 1.06 TB -> STRUMIENIUJEMY podzbior, nie pobieramy calosci.
 
 Wspolny manifest ma kolumny: path, label (0=real/1=fake), generator, source.
+Sciezki w manifestach sa WZGLEDNE (np. 'cocoai_extracted/cocoai_12.jpg') — ten sam manifest dziala
+niezaleznie od tego, gdzie lezy kopia obrazow (Drive albo dysk lokalny Colaba).
 
-Uzycie (w Colab, po zamontowaniu Drive):
-    pip install -U "huggingface_hub>=0.23" datasets "pandas==2.2.2" "pillow<12.0" scikit-learn
-    python ml/prepare_data.py
+Uzycie (w Colab, po zamontowaniu Drive) — TRYB ZALECANY (budowa na dysku lokalnym):
+    pip install -q datasets "pandas==2.2.2" "pillow<12.0" scikit-learn
+    python ml/prepare_data.py --skip-artifact --work-dir /content/aidata
+  -> obrazy powstaja na szybkim dysku lokalnym, a na Drive trafia JEDNO archiwum
+     aidata_images.tar (+ kopie manifestow). Po kazdym zrodle zapisywany jest tez czesciowy
+     parts/<zrodlo>.tar — po rozlaczeniu Colaba ponowne uruchomienie tej samej komendy
+     odtworzy gotowe zrodla z Drive zamiast pobierac je od nowa.
+  Tryb stary (bez --work-dir) zapisuje tysiace malych plikow bezposrednio na Drive — wolny i zawodny.
+
 Najwazniejsze parametry: --holdout (generator wykluczony z treningu), --modern-per-gen-cap, --skip-*,
---data-root (gdzie zapisac dane na Drive), --openfake-max-scan (limit czasu/transferu OpenFake).
+--data-root (katalog projektu na Drive), --openfake-max-scan (limit czasu/transferu OpenFake).
 
 Funkcje build_transforms() i ArtifactDataset (na dole) sa importowalne w treningu (Etap 3).
 """
 import os
 import glob
+import json
+import time
 import random
 import argparse
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -36,7 +47,10 @@ import pandas as pd
 def parse_args():
     p = argparse.ArgumentParser(description="Przygotowanie danych (ArtiFact + COCOAI + OpenFake)")
     p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector",
-                   help="Glowny katalog projektu na Drive. Wszystkie dane laduja w jego podfolderach.")
+                   help="Glowny katalog projektu na Drive (archiwa .tar, manifesty, modele).")
+    p.add_argument("--work-dir", default="",
+                   help="ZALECANE: katalog na DYSKU LOKALNYM (np. /content/aidata), w ktorym powstaja obrazy; "
+                        "na Drive trafia tylko archiwum .tar. Puste = stary tryb (pliki prosto na Drive).")
     p.add_argument("--save-size", type=int, default=200,
                    help="Rozdzielczosc zapisu (ujednolicenie domeny; ArtiFact ma natywnie 200)")
     p.add_argument("--img-size", type=int, default=224, help="Wejscie modelu (uzywane w transforms)")
@@ -90,8 +104,8 @@ def normalize_generator(model_name):
 # --------------------------------------------------------------------------- #
 # 1. ArtiFact -> indeks (pliki juz na dysku)
 # --------------------------------------------------------------------------- #
-def prepare_artifact(data_root, skip):
-    artifact_dir = os.path.join(data_root, "artifact_raw")
+def prepare_artifact(root, skip):
+    artifact_dir = os.path.join(root, "artifact_raw")
     if not skip:
         from huggingface_hub import snapshot_download
         print(f"[artifact] pobieranie bitmind/ArtiFact -> {artifact_dir} (~31.7 GB, wznawialne)")
@@ -111,7 +125,7 @@ def prepare_artifact(data_root, skip):
         pcol = cols.get("image_path") or cols.get("path") or list(df.columns)[0]
         lcol = cols.get("target") or cols.get("label")
         for _, r in df.iterrows():
-            rows.append({"path": os.path.join(folder, str(r[pcol])),
+            rows.append({"path": os.path.relpath(os.path.join(folder, str(r[pcol])), root),
                          "label": int(r[lcol]), "generator": generator, "source": "artifact"})
     out = pd.DataFrame(rows)
     print(f"[artifact] obrazow: {len(out)} | klasy: {out.label.value_counts().to_dict()}")
@@ -123,8 +137,8 @@ def prepare_artifact(data_root, skip):
 # --------------------------------------------------------------------------- #
 COCOAI_LABEL_B = {0: "real", 1: "sd-2.1", 2: "sdxl", 3: "sd-3.5", 4: "dalle", 5: "midjourney"}
 
-def prepare_cocoai(data_root, save_size, per_gen_cap, skip, seed):
-    out_dir = os.path.join(data_root, "cocoai_extracted")
+def prepare_cocoai(root, save_size, per_gen_cap, skip, seed):
+    out_dir = os.path.join(root, "cocoai_extracted")
     manifest = os.path.join(out_dir, "_index.csv")
     if skip and os.path.exists(manifest):
         print("[cocoai] pomijam (uzywam istniejacego _index.csv)")
@@ -147,10 +161,11 @@ def prepare_cocoai(data_root, save_size, per_gen_cap, skip, seed):
         if counts.get(key, 0) >= per_gen_cap:              # cap per generator (i osobno realne)
             continue
         counts[key] = counts.get(key, 0) + 1
-        path = os.path.join(out_dir, f"cocoai_{i}.jpg")
+        rel = f"cocoai_extracted/cocoai_{i}.jpg"            # sciezka WZGLEDNA wobec root
+        path = os.path.join(root, rel)
         if not os.path.exists(path):
             save_resized(ex["Image"], path, save_size)
-        rows.append({"path": path, "label": label, "generator": gen, "source": "cocoai"})
+        rows.append({"path": rel, "label": label, "generator": gen, "source": "cocoai"})
     out = pd.DataFrame(rows)
     out.to_csv(manifest, index=False)
     print(f"[cocoai] zapisano: {len(out)} | per-bucket: {counts}")
@@ -160,8 +175,8 @@ def prepare_cocoai(data_root, save_size, per_gen_cap, skip, seed):
 # --------------------------------------------------------------------------- #
 # 3. OpenFake -> STRUMIENIOWO pobierany podzbior (calosc to 1.06 TB!)
 # --------------------------------------------------------------------------- #
-def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip, seed):
-    out_dir = os.path.join(data_root, "openfake_extracted")
+def prepare_openfake(root, save_size, per_gen_cap, real_cap, max_scan, skip, seed):
+    out_dir = os.path.join(root, "openfake_extracted")
     manifest = os.path.join(out_dir, "_index.csv")
     if skip and os.path.exists(manifest):
         print("[openfake] pomijam (uzywam istniejacego _index.csv)")
@@ -192,13 +207,14 @@ def prepare_openfake(data_root, save_size, per_gen_cap, real_cap, max_scan, skip
             gen = normalize_generator(ex["model"])
             key, label, cap = gen, 1, per_gen_cap
         if counts.get(key, 0) < cap:
-            path = os.path.join(out_dir, f"openfake_{seen}.jpg")
+            rel = f"openfake_extracted/openfake_{seen}.jpg"   # sciezka WZGLEDNA wobec root
+            path = os.path.join(root, rel)
             try:
                 if not os.path.exists(path):
                     img = Image.open(io.BytesIO(ex["image"]["bytes"]))
                     save_resized(img, path, save_size)
                 counts[key] = counts.get(key, 0) + 1     # licz dopiero po udanym zapisie
-                rows.append({"path": path, "label": label, "generator": gen, "source": "openfake"})
+                rows.append({"path": rel, "label": label, "generator": gen, "source": "openfake"})
             except Exception:
                 bad += 1                                 # uszkodzony obraz -> pomijamy, nie przerywamy
         if seen % 2000 == 0:
@@ -220,9 +236,9 @@ def cap_per_generator(df, cap, seed):
     return pd.concat(parts).reset_index(drop=True) if parts else df
 
 
-def build_splits(index, args):
+def build_splits(index, args, root):
     from sklearn.model_selection import train_test_split
-    manifest_dir = os.path.join(args.data_root, "manifests")
+    manifest_dir = os.path.join(root, "manifests")
     os.makedirs(manifest_dir, exist_ok=True)
 
     holdout = set(args.holdout)
@@ -267,12 +283,33 @@ def build_splits(index, args):
     ]).sample(frac=1, random_state=args.seed)
 
     cols = ["path", "label", "generator", "source"]
-    for name, part in [("train", train), ("val", val), ("test", test), ("test_heldout", heldout)]:
+    splits = [("train", train), ("val", val), ("test", test), ("test_heldout", heldout)]
+    for name, part in splits:
         out = os.path.join(manifest_dir, f"{name}.csv")
         part[cols].to_csv(out, index=False)
         print(f"[split] {name:13s}: {len(part):>6} | klasy={part.label.value_counts().to_dict()}"
               f" | generatory={part.generator.nunique()} -> {out}")
     print(f"[split] held-out generatory (poza treningiem): {sorted(holdout)}")
+
+    # --- materialy do pracy: rozklad per generator + metadane biegu (reprodukowalnosc) ---
+    counts = pd.concat([p_.assign(split=n_) for n_, p_ in splits])
+    counts = (counts.groupby(["split", "source", "generator", "label"]).size()
+              .rename("n").reset_index())
+    counts.to_csv(os.path.join(manifest_dir, "per_generator_counts.csv"), index=False)
+    info = {
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "datasets": {"artifact": "bitmind/ArtiFact", "openfake": "ComplexDataLab/OpenFake (config core)",
+                     "cocoai": "Rajarshi-Roy-research/Defactify_Image_Dataset"},
+        "args": {k: v for k, v in vars(args).items()},
+        "pool_before_balance": {"total": int(len(index)),
+                                "per_class": {int(k): int(v) for k, v in index.label.value_counts().items()},
+                                "per_source": {k: int(v) for k, v in index.source.value_counts().items()}},
+        "splits": {n_: {"n": int(len(p_)),
+                        "per_class": {int(k): int(v) for k, v in p_.label.value_counts().items()},
+                        "generators": int(p_.generator.nunique())} for n_, p_ in splits},
+    }
+    json.dump(info, open(os.path.join(manifest_dir, "dataset_info.json"), "w"), indent=2, ensure_ascii=False)
+    print(f"[split] zapisano per_generator_counts.csv i dataset_info.json -> {manifest_dir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -290,9 +327,11 @@ def build_transforms(img_size=224):
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
+    # Ewaluacja: CALY obraz przeskalowany do img_size (bez wycinania srodka).
+    # Konwencja ImageNet (Resize 1.14x + CenterCrop) obcina ~12% brzegow i zmienia skale wzgledem
+    # treningu; u nas obrazy sa juz kwadratowe 200 px, a artefakty generatora sa w calym kadrze.
     eval_tf = transforms.Compose([
-        transforms.Resize(int(img_size * 1.14)),
-        transforms.CenterCrop(img_size),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
@@ -309,10 +348,15 @@ class ArtifactDataset:
     RETRIES = 4        # liczba prob odczytu
     RETRY_WAIT = 1.5   # bazowa pauza [s]; rosnie liniowo: 1.5s, 3s, 4.5s...
 
-    def __init__(self, manifest_csv, transform):
+    def __init__(self, manifest, transform, root=""):
+        """manifest: sciezka do CSV albo gotowy DataFrame.
+        root: katalog, wzgledem ktorego rozwiazywane sa WZGLEDNE sciezki z manifestu
+              (sciezki bezwzgledne ze starych manifestow dzialaja bez zmian)."""
         from PIL import Image
         self._Image = Image
-        self.df = pd.read_csv(manifest_csv)
+        df = manifest if isinstance(manifest, pd.DataFrame) else pd.read_csv(manifest)
+        self.df = df.reset_index(drop=True)
+        self.root = root
         self.transform = transform
 
     def __len__(self):
@@ -332,35 +376,93 @@ class ArtifactDataset:
 
     def __getitem__(self, i):
         row = self.df.iloc[i]
-        img = self._open_with_retry(row["path"])
+        img = self._open_with_retry(os.path.join(self.root, row["path"]))
         return self.transform(img), int(row["label"])
 
 
 # --------------------------------------------------------------------------- #
-# Main
+# 6. Archiwa .tar na Drive (tryb --work-dir)
 # --------------------------------------------------------------------------- #
+ARCHIVE_NAME = "aidata_images.tar"
+SOURCE_DIRS = {"artifact": "artifact_raw", "cocoai": "cocoai_extracted", "openfake": "openfake_extracted"}
+
+
+def _tar_to_drive(work_dir, subdirs, dst):
+    """Pakuje podkatalogi work_dir do JEDNEGO pliku na Drive. Zapis idzie do pliku .partial,
+    a dopiero po sukcesie zmieniamy nazwe — przerwany zapis nie zostawi 'pozornie dobrego' archiwum."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".partial"
+    t0 = time.time()
+    subprocess.run(["tar", "-cf", tmp, "-C", work_dir] + subdirs, check=True)
+    os.replace(tmp, dst)
+    print(f"[tar] {dst} ({os.path.getsize(dst) / 1e9:.2f} GB, {time.time() - t0:.0f}s)")
+
+
+def restore_part(work_dir, data_root, src):
+    """Jesli zrodlo zostalo juz zbudowane we wczesniejszej (przerwanej) sesji, odtworz je z Drive."""
+    sub = SOURCE_DIRS[src]
+    part = os.path.join(data_root, "parts", f"{src}.tar")
+    if os.path.exists(os.path.join(work_dir, sub, "_index.csv")):
+        return True                                   # juz jest lokalnie (ta sama sesja)
+    if os.path.exists(part):
+        print(f"[{src}] odtwarzam gotowe zrodlo z {part} (zamiast budowac od nowa)...")
+        subprocess.run(["tar", "-xf", part, "-C", work_dir], check=True)
+        return True
+    return False
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
+    local = bool(args.work_dir)
+    root = args.work_dir if local else args.data_root   # gdzie powstaja obrazy
+    os.makedirs(root, exist_ok=True)
     os.makedirs(args.data_root, exist_ok=True)
-    print(f"[info] Wszystkie dane zapisuje w: {args.data_root}")
-    print(f"[info] Podfoldery: artifact_raw/ cocoai_extracted/ openfake_extracted/ manifests/\n")
+    print(f"[info] Obrazy buduje w: {root} ({'dysk LOKALNY' if local else 'Drive — tryb stary, wolny'})")
+    print(f"[info] Katalog projektu (Drive): {args.data_root}\n")
 
+    steps = [
+        ("artifact", args.skip_artifact,
+         lambda skip: prepare_artifact(root, skip)),
+        ("cocoai", args.skip_cocoai,
+         lambda skip: prepare_cocoai(root, args.save_size, args.modern_per_gen_cap, skip, args.seed)),
+        ("openfake", args.skip_openfake,
+         lambda skip: prepare_openfake(root, args.save_size, args.modern_per_gen_cap,
+                                       args.openfake_real_cap, args.openfake_max_scan, skip, args.seed)),
+    ]
     parts = []
-    parts.append(prepare_artifact(args.data_root, args.skip_artifact))
-    parts.append(prepare_cocoai(args.data_root, args.save_size, args.modern_per_gen_cap,
-                                args.skip_cocoai, args.seed))
-    parts.append(prepare_openfake(args.data_root, args.save_size, args.modern_per_gen_cap,
-                                  args.openfake_real_cap, args.openfake_max_scan,
-                                  args.skip_openfake, args.seed))
+    for src, skip, fn in steps:
+        restored = local and src != "artifact" and restore_part(root, args.data_root, src)
+        df = fn(skip or restored)
+        parts.append(df)
+        # checkpoint zrodla na Drive -> rozlaczenie Colaba nie marnuje godzin pobierania
+        if local and src != "artifact" and not restored and len(df):
+            _tar_to_drive(root, [SOURCE_DIRS[src]], os.path.join(args.data_root, "parts", f"{src}.tar"))
 
     index = pd.concat(parts, ignore_index=True)
     print(f"\n[indeks] LACZNIE: {len(index)} | klasy={index.label.value_counts().to_dict()}")
     print(index.groupby("source").size().to_dict())
 
-    build_splits(index, args)
-    print("\nGotowe. Manifesty w:", os.path.join(args.data_root, "manifests"))
+    build_splits(index, args, root)
+
+    if local:
+        # 1) kopia manifestow na Drive (male pliki, wygodne do podgladu i do pracy)
+        import shutil
+        drive_man = os.path.join(args.data_root, "manifests")
+        os.makedirs(drive_man, exist_ok=True)
+        for f in os.listdir(os.path.join(root, "manifests")):
+            shutil.copy(os.path.join(root, "manifests", f), drive_man)
+        # 2) jedno archiwum: obrazy + manifesty (spojna, zamrozona migawka zbioru)
+        present = [d for d in list(SOURCE_DIRS.values()) + ["manifests"]
+                   if os.path.isdir(os.path.join(root, d))]
+        _tar_to_drive(root, present, os.path.join(args.data_root, ARCHIVE_NAME))
+        open(os.path.join(root, ".complete"), "w").write("built locally\n")  # train.py nie rozpakuje ponownie
+        print("\n[WAZNE] Przed zamknieciem sesji uruchom w notebooku: "
+              "from google.colab import drive; drive.flush_and_unmount()\n"
+              "        (wymusza dokonczenie wysylki plikow na Drive).")
+
+    print("\nGotowe. Manifesty w:", os.path.join(root, "manifests"))
 
 
 if __name__ == "__main__":
