@@ -17,7 +17,7 @@ w kazdej epoce wynikaja z (seed + numer epoki) — wznowiony bieg widzi te same 
 Uzycie (Colab, GPU: Runtime -> Change runtime type -> T4 GPU):
     from google.colab import drive; drive.mount('/content/drive')
     %cd /content/ai-image-detector
-    !pip install -q "pandas==2.2.2" "pillow<12.0"
+    !pip install -q datasets   # bez pinow pandas/pillow (Colab ma Python 3.13)
     !python ml/train.py --limit 4000 --epochs 1 --tag _smoke   # szybki test
     !python ml/train.py                                         # pelny bieg
     !python ml/train.py --resume                                # wznowienie po rozlaczeniu

@@ -16,7 +16,7 @@ Sciezki w manifestach sa WZGLEDNE (np. 'cocoai_extracted/cocoai_12.jpg') — ten
 niezaleznie od tego, gdzie lezy kopia obrazow (Drive albo dysk lokalny Colaba).
 
 Uzycie (w Colab, po zamontowaniu Drive) — TRYB ZALECANY (budowa na dysku lokalnym):
-    pip install -q datasets "pandas==2.2.2" "pillow<12.0" scikit-learn
+    pip install -q datasets
     python ml/prepare_data.py --skip-artifact --work-dir /content/aidata
   -> obrazy powstaja na szybkim dysku lokalnym, a na Drive trafia JEDNO archiwum
      aidata_images.tar (+ kopie manifestow). Po kazdym zrodle zapisywany jest tez czesciowy

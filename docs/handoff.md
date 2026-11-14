@@ -62,7 +62,7 @@ Python + FastAPI w kontenerze na Google Cloud Run.
 podfoldery: `cocoai_extracted/`, `openfake_extracted/`, `artifact_raw/`, `manifests/`, `models/`.
 
 **Manifesty** (`manifests/*.csv`, kolumny `path, label, generator, source`; label 0=real, 1=fake):
-- `train.csv` ≈ 103 202 (50/50), `val.csv` / `test.csv` ≈ 12 901 każdy, `test_heldout.csv` ≈ 1 820.
+- `train.csv` = 102 744 (50/50), `val.csv` / `test.csv` = 12 844 każdy, `test_heldout.csv` = 1 826 (913 Imagen) — zbiór z 14.11.2026, w `aidata_images.tar`.
 - **Held-out generator = `imagen`** (nigdy w treningu — służy do pomiaru generalizacji).
 - Parametry: **seed=42**, obrazy **200×200 px**, normalizacja ImageNet (mean/std).
 
@@ -117,3 +117,4 @@ trening już przeszedł — od Etapu 4 (ewaluacja). Trzymaj styl: po polsku, ite
 - Transform ewaluacyjny: pełny obraz `Resize((s, s))` zamiast Resize 1.14× + CenterCrop (obrazy są kwadratowe 200 px).
 - Smoke test (2.07.2026, stary kod, odczyt z Drive): val_acc 0.80 po 1 epoce na 4k obrazów, ale ~5 obr./s przez Drive.
 - Do decyzji: `--img-size 200` (bez interpolacji) vs 224 (domyślne).
+- **Piny `pandas==2.2.2` i `pillow<12.0` są nieaktualne** — Colab ma teraz Pythona 3.13 (brak wheela pandas 2.2.2, pip próbuje kompilować i pada). Kod działa z pandas 3.x / Pillow 12 (stary `groupby.apply` usunięty). Instalować tylko `datasets`.

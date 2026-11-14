@@ -1,7 +1,7 @@
 # Detektor obrazów generowanych przez AI — metodologia i postęp prac
 
 **Autor:** Kamil Knapik
-**Stan na:** czerwiec 2026
+**Stan na:** listopad 2026
 **Tytuł pracy:** *Metody rozpoznawania obrazów w problemie wykrywania treści wygenerowanych przez modele generatywne*
 
 Dokument podsumowuje stan realizacji i decyzje metodologiczne. Sekcja 6 to lista rzeczy, które warto zapisywać na bieżąco, aby ułatwić pisanie pracy (reprodukowalność + materiał na rozdziały o danych, metodzie i wynikach).
@@ -70,12 +70,14 @@ Stratyfikowany podział `train/val/test` (80/10/10) po kombinacji `(klasa × gen
 
 | Część | Liczność | Balans (real/fake) | Generatory |
 | --- | --- | --- | --- |
-| train | 103 202 | 51 600 / 51 602 | 51 |
-| val | 12 901 | 6 451 / 6 450 | 51 |
-| test (in-distribution) | 12 901 | 6 451 / 6 450 | 51 |
-| **test_heldout (Imagen)** | 1 820 | 910 / 910 | 1 (Imagen) + real |
+| train | 102 744 | 51 372 / 51 372 | 50 |
+| val | 12 844 | 6 422 / 6 422 | 50 |
+| test (in-distribution) | 12 844 | 6 422 / 6 422 | 50 |
+| **test_heldout (Imagen)** | 1 826 | 913 / 913 | 1 (Imagen) + real |
 
-Pula przed balansem: 159 995 obrazów (68 000 real, 91 995 fake). Po zasadach z 3.3 limiterem była klasa fake (64 502 po capie), stąd ~64,5 tys./klasę.
+Pula przed balansem: 159 774 obrazów (68 000 real, 91 774 fake; COCOAI 48 000 + OpenFake 111 774 ze skanu 120 000 wierszy). Po zasadach z 3.3 limiterem była klasa fake (64 216 po capie), stąd ~64,2 tys./klasę.
+
+Budowa zbioru: 14.11.2026, Colab (Python 3.13, datasets 4.8.5, pandas 2.2.3, Pillow 11.3), seed=42. Rewizja OpenFake (commit HF): `00b2f0ae3f5f7684c4b00f794f4c500076a9355d` — wcześniejszy bieg (czerwiec, rewizja `89dc06b2…`) dawał 103 202 / 12 901 / 12 901 / 1 820; różnice wynikają z aktualizacji zbioru na HF. Pełna migawka (obrazy + manifesty + `dataset_info.json` + `per_generator_counts.csv`): `aidata_images.tar` (3,25 GB) na Drive.
 
 > Uwaga: ArtiFact nie został jeszcze włączony (bieg modern-only). Pełny zbiór z ArtiFact + większym podzbiorem OpenFake planowany jest na finalne wyniki.
 
@@ -97,7 +99,7 @@ Poniższe wybory warto wprost uzasadnić w rozdziale o metodzie, bo bezpośredni
 
 - Generatory ArtiFact pochodzą z 2023 r. — bez najnowszych modeli; dlatego dołożono OpenFake/COCOAI.
 - Realne obrazy pochodzą głównie z COCO i LAION — ograniczona różnorodność „dziedziny realnej".
-- Held-out (Imagen) jest niewielki (910 fake) przy obecnym podzbiorze OpenFake — przy pełnym biegu będzie większy.
+- Held-out (Imagen) jest niewielki (913 fake) przy obecnym podzbiorze OpenFake — przy pełnym biegu będzie większy.
 - OpenFake: część obrazów z modeli zamkniętych objęta licencją non-commercial (dopuszczalne dla pracy dyplomowej; do odnotowania).
 
 ---
