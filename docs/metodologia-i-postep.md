@@ -83,6 +83,58 @@ Budowa zbioru: 14.11.2026, Colab (Python 3.13, datasets 4.8.5, pandas 2.2.3, Pil
 
 ---
 
+## 3a. Wyniki — EfficientNet-B0 (bieg 14–15.11.2026)
+
+### Konfiguracja treningu
+
+EfficientNet-B0 (4,01 mln parametrów, wagi ImageNet `IMAGENET1K_V1`), głowica 2-klasowa, wejście **200×200** (natywna
+rozdzielczość zbioru — bez interpolacji), AdamW (lr 3e-4, weight decay 1e-4), CosineAnnealingLR (T_max = 8), batch 64,
+AMP, CrossEntropyLoss, augmentacja: RandomResizedCrop (0,85–1,0), flip poziomy, lekki ColorJitter (0,1). Early stopping
+(patience 3) i **wybór checkpointu wg minimalnej straty walidacyjnej** (kryterium ustalone przed ewaluacją na teście).
+Sprzęt: Google Colab, Tesla T4, 2 vCPU; czas: 8 epok, **72,3 min** (~9 min/epokę). Seed = 42.
+
+### Przebieg uczenia (`models/learning_curves.png`)
+
+Najlepsza epoka wg val_loss: **5** (val_loss 0,1997, val_acc 92,65%). Od epoki 5 strata treningowa dalej spada
+(0,107 → 0,044), a walidacyjna lekko rośnie (→ 0,213), przy wciąż rosnącej val_acc (→ 93,69% w epoce 8) — model
+poprawia decyzje, ale staje się nadmiernie pewny siebie na błędach (pogorszenie kalibracji). Luka train/val
+(98% vs 94%) wskazuje na przeuczenie — materiał do dyskusji o regularyzacji / ablacjach.
+
+### Metryki (klasa pozytywna = AI, próg 0,5)
+
+| Checkpoint | Zbiór | Acc | Precision | Recall | F1 | AUC | ECE | Log-loss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **epoka 5 (wybrany)** | test (in-distribution, n=12 844) | 92,71% | 92,77% | 92,65% | 92,71% | 0,979 | 0,024 | 0,203 |
+| **epoka 5 (wybrany)** | test_heldout — Imagen (n=1 826) | 89,05% | 91,50% | 86,09% | 88,71% | 0,958 | 0,050 | 0,318 |
+| epoka 8 (ostatni) | test | 93,80% | 94,10% | 93,46% | 93,78% | 0,982 | 0,034 | 0,224 |
+| epoka 8 (ostatni) | test_heldout — Imagen | 89,92% | 93,44% | 85,87% | 89,50% | 0,964 | 0,064 | 0,363 |
+
+ECE (expected calibration error, 15 przedziałów), log-loss i 95% przedziały ufności (bootstrap, 1000 prób) liczy `ml/eval.py` (`summary.csv`, `calibration_*.png`). 95% CI dla epoki 5: test acc [92,25; 93,16]%, AUC [0,977; 0,981]; held-out acc [87,68; 90,36]%, recall [83,85; 88,21]%, AUC [0,949; 0,965]. Przedziały testu i held-out się nie nakładają — spadek na nieznanym generatorze jest istotny. Diagram kalibracji: słupki systematycznie poniżej przekątnej w przedziale pewności 0,6–0,95 → model jest nadmiernie pewny siebie (kandydat: temperature scaling na zbiorze walidacyjnym).
+Epoka 8 ma ~1 pp wyższą trafność, ale gorszą kalibrację (ECE, log-loss; 80% vs 66% predykcji z pewnością > 0,99).
+Ponieważ aplikacja zwraca **poziom pewności**, kalibracja jest istotna — co uzasadnia kryterium val_loss.
+Wynik epoki 8 raportować jako analizę uzupełniającą (nie wybierać checkpointu na podstawie testu).
+
+### Generalizacja na nieznany generator (Imagen)
+
+- Spadek wykrywalności fake: recall **92,65% → 86,09%** (−6,6 pp), AUC 0,979 → 0,958. Skuteczność na realnych w
+  held-out (~92%) jest jak w teście — spadek dotyczy wyłącznie wykrywania obrazów z nieznanego generatora.
+- Rozkład P(AI) dla Imagen jest dwumodalny: mediana 0,994 (większość wykrywana pewnie), ~14% przeoczeń.
+- **Zastrzeżenie:** Imagen pochodzi z tego samego zbioru (OpenFake: te same prompty, realne z LAION, ten sam
+  pipeline) — to test generalizacji **między generatorami**, nie między zbiorami/domenami. Test cross-dataset
+  (inne źródło realnych, kompresja z social mediów) prawdopodobnie da większy spadek.
+
+### Analiza per źródło i per generator (test in-distribution, epoka 5)
+
+| Źródło | Real (specyficzność) | Fake (recall) | AUC |
+| --- | --- | --- | --- |
+| COCOAI | 94,6% (n=755) | 96,4% (n=2 505) | 0,992 |
+| OpenFake | 92,5% (n=5 667) | 90,2% (n=3 917) | 0,971 |
+
+Najtrudniejsze generatory (n ≥ 100): OpenFake FLUX 86,0%, HiDream 86,4%, Midjourney 86,7%, Ideogram 89,5%,
+SDXL 90,0%, GPT-Image 90,1%. Najłatwiejsze: COCOAI DALL·E 99,1%, SDXL 98,0%, SD3.5 97,6%. Ten sam generator jest
+trudniejszy w OpenFake niż w COCOAI (np. Midjourney 86,7% vs 91,9%) — OpenFake ma bardziej zróżnicowane treści
+i nowsze wersje modeli. Pełna tabela: `models/eval/per_generator_test.csv`.
+
 ## 4. Decyzje metodologiczne — argumentacja do pracy
 
 Poniższe wybory warto wprost uzasadnić w rozdziale o metodzie, bo bezpośrednio wpływają na wiarygodność wyników:

@@ -118,3 +118,11 @@ trening już przeszedł — od Etapu 4 (ewaluacja). Trzymaj styl: po polsku, ite
 - Smoke test (2.07.2026, stary kod, odczyt z Drive): val_acc 0.80 po 1 epoce na 4k obrazów, ale ~5 obr./s przez Drive.
 - Do decyzji: `--img-size 200` (bez interpolacji) vs 224 (domyślne).
 - **Piny `pandas==2.2.2` i `pillow<12.0` są nieaktualne** — Colab ma teraz Pythona 3.13 (brak wheela pandas 2.2.2, pip próbuje kompilować i pada). Kod działa z pandas 3.x / Pillow 12 (stary `groupby.apply` usunięty). Instalować tylko `datasets`.
+
+## Stan na 2026-11-15
+
+- **Etap 3 i 4 dla EfficientNet-B0 — ZROBIONE.** Trening `--img-size 200` (72 min, T4), najlepsza epoka 5 (wg val_loss).
+  Test: acc 92,7%, AUC 0,979; held-out Imagen: acc 89,1%, recall 86,1%, AUC 0,958. Szczegóły, kalibracja (ECE)
+  i analiza per źródło/generator: `docs/metodologia-i-postep.md`, sekcja 3a. Wyniki na Drive: `models/eval/`, `models/eval_last/`.
+- Do zrobienia: ViT-base do porównania, ablacje (`--no-aug`, `--no-pretrained`, `--img-size 224`), ew. ECE/diagram
+  kalibracji w `eval.py`, eksport + integracja z ML Service.
