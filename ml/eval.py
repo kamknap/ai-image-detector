@@ -140,7 +140,7 @@ def main():
     model = build_model(device, pretrained=False)
     model.load_state_dict(ckpt["model_state"])
     img_size = args.img_size or ckpt.get("img_size", 224)
-    print(f"[info] checkpoint z epoki {ckpt.get('epoch')} | val_acc={ckpt.get('val_acc'):.4f} "
+    print(f"[info] checkpoint z epoki {ckpt.get('epoch')} | val_acc={ckpt.get('val_acc', float('nan')):.4f} "
           f"| img_size={img_size}")
 
     _, eval_tf = build_transforms(img_size)             # transform walidacyjny (bez augmentacji!)
