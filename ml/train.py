@@ -254,7 +254,7 @@ def main():
         # Rozbieg stabilizuje fine-tuning transformerow (duze, losowe gradienty nowej glowicy na starcie).
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [
             torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_epochs),
-            torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)],
+            torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - args.warmup_epochs))],
             milestones=[args.warmup_epochs])
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
