@@ -1,10 +1,13 @@
 """
-Etap 3 — Trening EfficientNet-B0 (Real vs AI-generated).
+Etap 3 — Trening klasyfikatora Real vs AI-generated: EfficientNet-B0 (torchvision) lub ViT (timm).
 
 Co robi:
   1. Rozpakowuje archiwum aidata_images.tar z Drive na dysk lokalny Colaba (jeden duzy plik
      zamiast ~100k malych — minuty zamiast godzin) i czyta manifesty z tej samej migawki.
-  2. Laduje EfficientNet-B0 z wagami ImageNet (transfer learning) i podmienia glowice na 2-klasowa.
+  2. Laduje siec z wagami pre-trenowanymi (transfer learning) i podmienia glowice na 2-klasowa:
+       --arch efficientnet_b0 (domyslnie; 4,0 M param., wagi ImageNet-1k)
+       --arch vit_small       (ViT-S/16, 22 M param., timm augreg: ImageNet-21k -> 1k; wymaga: pip install timm)
+       --arch vit_base        (ViT-B/16, 86 M param., timm augreg2)
   3. Trenuje z walidacja, mixed precision (AMP), cosine LR, early stopping.
   4. Po KAZDEJ epoce zapisuje pelny checkpoint na Drive (model + optymalizator + scheduler + historia),
      wiec po rozlaczeniu Colaba mozna wznowic trening flaga --resume.
@@ -21,8 +24,11 @@ Uzycie (Colab, GPU: Runtime -> Change runtime type -> T4 GPU):
     !python ml/train.py --limit 4000 --epochs 1 --tag _smoke   # szybki test
     !python ml/train.py                                         # pelny bieg
     !python ml/train.py --resume                                # wznowienie po rozlaczeniu
+    !python ml/train.py --arch vit_small --img-size 224 --lr 1e-4 --weight-decay 0.05 --warmup-epochs 1 --tag _vits
 
-Wynik (na Drive, models/): efficientnet_b0_best<tag>.pt, last<tag>.pt, history<tag>.json, config<tag>.json
+Wynik (na Drive, models/): <arch>_best<tag>.pt, last<tag>.pt, history<tag>.json, config<tag>.json
+(dla architektury innej niz efficientnet_b0 bez --tag ustawiany jest automatycznie tag _<arch>,
+ zeby nie nadpisac plikow EfficientNetu)
 """
 import os
 import sys
@@ -41,12 +47,24 @@ from torchvision import models
 
 # pozwala zaimportowac prepare_data niezaleznie od katalogu uruchomienia
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare_data import build_transforms, ArtifactDataset, ARCHIVE_NAME
+from prepare_data import build_transforms, ArtifactDataset, ARCHIVE_NAME, IMAGENET_MEAN, IMAGENET_STD
+
+# Rejestr architektur: nazwa w CLI -> identyfikator wag w timm (None = torchvision)
+ARCHS = {
+    "efficientnet_b0": None,
+    "vit_small": "vit_small_patch16_224.augreg_in21k_ft_in1k",
+    "vit_base": "vit_base_patch16_224.augreg2_in21k_ft_in1k",
+}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Trening EfficientNet-B0 (Real vs AI)")
     p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector")
+    p.add_argument("--arch", default="efficientnet_b0", choices=list(ARCHS))
+    p.add_argument("--drop-path", type=float, default=0.1,
+                   help="ViT: stochastic depth (regularyzacja; EfficientNet ma wlasne 0.2 wbudowane)")
+    p.add_argument("--warmup-epochs", type=int, default=0,
+                   help="Liniowy rozbieg LR przez N epok (zalecane 1 dla ViT; 0 = jak w biegu EfficientNet)")
     p.add_argument("--local-root", default="/content/aidata",
                    help="Gdzie rozpakowac archiwum z obrazami (szybki dysk lokalny Colaba)")
     p.add_argument("--no-cache", action="store_true",
@@ -146,14 +164,27 @@ def make_loader(manifest, transform, image_root, limit, batch_size, workers, shu
 # --------------------------------------------------------------------------- #
 # Model i petla treningowa
 # --------------------------------------------------------------------------- #
-def build_model(device, pretrained=True):
-    # EfficientNet-B0; pretrained=True -> wagi ImageNet (uczenie transferowe), False -> od zera (ablacja)
-    weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
-    model = models.efficientnet_b0(weights=weights)
-    # podmiana glowicy: oryginalnie 1000 klas ImageNet -> 2 klasy (Real=0, AI=1)
-    in_features = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(in_features, 2)
-    return model.to(device)
+def build_model(device, pretrained=True, arch="efficientnet_b0", img_size=224, drop_path=0.1):
+    """Zwraca (model, (mean, std)) — normalizacja wejscia zgodna z wagami pre-trenowanymi.
+    pretrained=False -> losowa inicjalizacja (ablacja / ladowanie wlasnego checkpointu)."""
+    if arch == "efficientnet_b0":
+        weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        model = models.efficientnet_b0(weights=weights)
+        # podmiana glowicy: oryginalnie 1000 klas ImageNet -> 2 klasy (Real=0, AI=1)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, 2)
+        norm = (IMAGENET_MEAN, IMAGENET_STD)
+    else:
+        import timm
+        if img_size % 16:
+            raise ValueError(f"ViT dzieli obraz na fragmenty 16x16 px — img_size musi byc wielokrotnoscia 16 "
+                             f"(np. 192, 208, 224), podano {img_size}")
+        # num_classes=2 -> timm sam podmienia glowice; img_size != 224 -> interpolacja embeddingow pozycyjnych
+        model = timm.create_model(ARCHS[arch], pretrained=pretrained, num_classes=2,
+                                  img_size=img_size, drop_path_rate=drop_path)
+        cfg = model.pretrained_cfg
+        norm = (list(cfg["mean"]), list(cfg["std"]))     # augreg ViT: mean=std=0.5 (nie ImageNet!)
+    return model.to(device), norm
 
 
 def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None):
@@ -188,9 +219,12 @@ def main():
     if device == "cpu":
         print("[ostrzezenie] Brak GPU! Wlacz: Runtime -> Change runtime type -> T4 GPU.")
 
+    if args.arch != "efficientnet_b0" and not args.tag:
+        args.tag = f"_{args.arch}"          # ochrona przed nadpisaniem plikow EfficientNetu
+        print(f"[info] brak --tag -> ustawiam tag '{args.tag}'")
     out_dir = os.path.join(args.data_root, args.out_subdir)
     os.makedirs(out_dir, exist_ok=True)
-    best_path = os.path.join(out_dir, f"efficientnet_b0_best{args.tag}.pt")
+    best_path = os.path.join(out_dir, f"{args.arch}_best{args.tag}.pt")
     last_path = os.path.join(out_dir, f"last{args.tag}.pt")
     hist_path = os.path.join(out_dir, f"history{args.tag}.json")
     cfg_path = os.path.join(out_dir, f"config{args.tag}.json")
@@ -198,10 +232,13 @@ def main():
     image_root = prepare_image_root(args.data_root, args.local_root, args.no_cache)
     man = manifest_dir(image_root, args.data_root)
 
-    train_tf, eval_tf = build_transforms(args.img_size)
+    model, (mean, std) = build_model(device, pretrained=not args.no_pretrained, arch=args.arch,
+                                     img_size=args.img_size, drop_path=args.drop_path)
+    n_params = sum(p.numel() for p in model.parameters())
+    train_tf, eval_tf = build_transforms(args.img_size, mean, std)
     if args.no_aug:                         # ablacja: trening bez augmentacji
         train_tf = eval_tf
-    print(f"[konfig] augmentacja={'NIE' if args.no_aug else 'TAK'} | "
+    print(f"[konfig] arch={args.arch} | augmentacja={'NIE' if args.no_aug else 'TAK'} | "
           f"pretrained(ImageNet)={'NIE' if args.no_pretrained else 'TAK'} | "
           f"img_size={args.img_size} | tag='{args.tag}'")
     train_dl, n_tr = make_loader(os.path.join(man, "train.csv"), train_tf, image_root, args.limit,
@@ -210,11 +247,17 @@ def main():
                                args.batch_size, args.num_workers, False, args.seed)
     print(f"[dane] train={n_tr}  val={n_va}  | batch={args.batch_size} | manifesty: {man}")
 
-    model = build_model(device, pretrained=not args.no_pretrained)
-    n_params = sum(p.numel() for p in model.parameters())
     criterion = nn.CrossEntropyLoss()                 # 2 wyjscia + softmax; klasy 50/50 -> bez wag
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    if args.warmup_epochs > 0:
+        # epoki 1..W: LR rosnie liniowo od 10% do 100%; potem cosinus do ~0.
+        # Rozbieg stabilizuje fine-tuning transformerow (duze, losowe gradienty nowej glowicy na starcie).
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [
+            torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_epochs),
+            torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)],
+            milestones=[args.warmup_epochs])
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     history, best_val, no_improve, start_epoch = [], float("inf"), 0, 1
@@ -233,12 +276,16 @@ def main():
             print("[resume] trening byl juz zakonczony — nic do zrobienia.")
             return
 
-    config = {"args": vars(args), "model": "efficientnet_b0", "n_params": n_params,
+    config = {"args": vars(args), "model": args.arch, "weights": ARCHS[args.arch] or "torchvision IMAGENET1K_V1",
+              "norm_mean": mean, "norm_std": std, "n_params": n_params,
               "device": gpu, "torch": torch.__version__, "n_train": n_tr, "n_val": n_va,
-              "optimizer": "AdamW", "scheduler": "CosineAnnealingLR", "loss": "CrossEntropyLoss",
+              "optimizer": "AdamW", "loss": "CrossEntropyLoss",
+              "scheduler": f"warmup {args.warmup_epochs} ep + CosineAnnealingLR" if args.warmup_epochs
+                           else "CosineAnnealingLR",
               "amp": device == "cuda", "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     json.dump(config, open(cfg_path, "w"), indent=2)
-    print(f"[model] EfficientNet-B0 | parametry: {n_params / 1e6:.2f} M | konfiguracja: {cfg_path}")
+    print(f"[model] {args.arch} | parametry: {n_params / 1e6:.2f} M | normalizacja mean={mean} std={std} "
+          f"| konfiguracja: {cfg_path}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         # ziarno zalezne od epoki -> kolejnosc danych i augmentacja identyczne po --resume
@@ -261,7 +308,8 @@ def main():
         if improved:
             best_val, no_improve = va_loss, 0
             torch.save({"epoch": epoch, "model_state": model.state_dict(), "val_acc": va_acc,
-                        "val_loss": va_loss, "img_size": args.img_size,
+                        "val_loss": va_loss, "img_size": args.img_size, "arch": args.arch,
+                        "norm_mean": mean, "norm_std": std,
                         "classes": {0: "real", 1: "ai"}}, best_path)
             print(f"   -> nowy najlepszy model (val_loss={va_loss:.4f}) zapisany: {best_path}")
         else:
@@ -271,7 +319,8 @@ def main():
         torch.save({"epoch": epoch, "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
                     "scaler_state": scaler.state_dict(), "history": history,
-                    "best_val": best_val, "no_improve": no_improve, "img_size": args.img_size}, last_path)
+                    "best_val": best_val, "no_improve": no_improve, "img_size": args.img_size,
+                    "arch": args.arch, "norm_mean": mean, "norm_std": std}, last_path)
 
         if not improved and no_improve >= args.patience:
             print(f"[early stopping] brak poprawy od {args.patience} epok — przerywam.")

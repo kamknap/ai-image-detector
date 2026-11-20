@@ -318,14 +318,16 @@ def build_splits(index, args, root):
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-def build_transforms(img_size=224):
+def build_transforms(img_size=224, mean=IMAGENET_MEAN, std=IMAGENET_STD):
+    """mean/std musza odpowiadac normalizacji, z ktora pre-trenowano wagi modelu
+    (EfficientNet/torchvision: statystyki ImageNet; ViT augreg z timm: 0.5/0.5)."""
     from torchvision import transforms
     train_tf = transforms.Compose([
         transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0)),
         transforms.RandomHorizontalFlip(0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        transforms.Normalize(mean, std),
     ])
     # Ewaluacja: CALY obraz przeskalowany do img_size (bez wycinania srodka).
     # Konwencja ImageNet (Resize 1.14x + CenterCrop) obcina ~12% brzegow i zmienia skale wzgledem
@@ -333,7 +335,7 @@ def build_transforms(img_size=224):
     eval_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        transforms.Normalize(mean, std),
     ])
     return train_tf, eval_tf
 

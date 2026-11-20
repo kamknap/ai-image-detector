@@ -20,6 +20,7 @@ Co robi:
 Uzycie (Colab, po treningu; dane rozpakowywane z aidata_images.tar jak w treningu):
     !python ml/eval.py                               # domyslny checkpoint (best)
     !python ml/eval.py --tag _noaug                  # checkpoint biegu ablacyjnego
+    !python ml/eval.py --arch vit_small --tag _vits  # ViT (architektura/normalizacja z checkpointu)
     !python ml/eval.py --from-predictions            # tylko przelicz metryki/wykresy z zapisanych
                                                      # predictions_*.csv (bez modelu i GPU, sekundy)
 """
@@ -42,7 +43,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Ewaluacja modelu (test + test_heldout)")
     p.add_argument("--data-root", default="/content/drive/MyDrive/ai-image-detector")
     p.add_argument("--checkpoint", default="",
-                   help="Sciezka do checkpointu .pt (domyslnie: models/efficientnet_b0_best<tag>.pt)")
+                   help="Sciezka do checkpointu .pt (domyslnie: models/<arch>_best<tag>.pt)")
+    p.add_argument("--arch", default="efficientnet_b0",
+                   help="Tylko do domyslnej sciezki checkpointu; architektura i tak jest czytana z checkpointu")
     p.add_argument("--local-root", default="/content/aidata")
     p.add_argument("--img-size", type=int, default=0,
                    help="0 = wez z checkpointu (ta sama rozdzielczosc co w treningu)")
@@ -259,16 +262,18 @@ def main():
         model = None
     else:
         ckpt_path = args.checkpoint or os.path.join(args.data_root, "models",
-                                                    f"efficientnet_b0_best{args.tag}.pt")
+                                                    f"{args.arch}_best{args.tag}.pt")
         print(f"[info] device={device} | checkpoint={ckpt_path}\n[info] wyniki -> {out_dir}")
         # model: ta sama architektura co w treningu, wagi z checkpointu (nie z ImageNet)
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        model = build_model(device, pretrained=False)
-        model.load_state_dict(ckpt["model_state"])
+        arch = ckpt.get("arch", "efficientnet_b0")      # starsze checkpointy nie mialy tego pola
         img_size = args.img_size or ckpt.get("img_size", 224)
+        model, (mean, std) = build_model(device, pretrained=False, arch=arch, img_size=img_size)
+        model.load_state_dict(ckpt["model_state"])
+        mean, std = ckpt.get("norm_mean", mean), ckpt.get("norm_std", std)
         print(f"[info] checkpoint z epoki {ckpt.get('epoch')} | "
-              f"val_acc={ckpt.get('val_acc', float('nan')):.4f} | img_size={img_size}")
-        _, eval_tf = build_transforms(img_size)         # transform walidacyjny (bez augmentacji!)
+              f"val_acc={ckpt.get('val_acc', float('nan')):.4f} | arch={arch} | img_size={img_size}")
+        _, eval_tf = build_transforms(img_size, mean, std)         # transform walidacyjny (bez augmentacji!)
         image_root = prepare_image_root(args.data_root, args.local_root, args.no_cache)
         man = manifest_dir(image_root, args.data_root)
 
